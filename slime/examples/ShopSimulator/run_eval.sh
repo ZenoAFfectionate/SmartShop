@@ -206,12 +206,13 @@ echo "评测 job 已提交: ${JOB_ID}"
 # 跟踪 job 日志直至结束（--follow 阻塞到 job 完成）
 "${RAY_BIN}" job logs --address="${RAY_ADDRESS}" --follow "${JOB_ID}" 2>&1 | tee "${RUN_ROOT}/eval.log"
 
-# 以 job 最终状态判定成败（job 运行失败不重试，只有提交失败才重试）
-STATUS="$("${RAY_BIN}" job status "${JOB_ID}" --address="${RAY_ADDRESS}" 2>/dev/null | tail -1)"
+# 以 job 最终状态判定成败（job 运行失败不重试，只有提交失败才重试）。
+# 注意：job status 输出含多行横幅，需匹配关键词而非盲取最后一行。
+STATUS="$("${RAY_BIN}" job status "${JOB_ID}" --address="${RAY_ADDRESS}" 2>/dev/null | grep -oE 'SUCCEEDED|FAILED|STOPPED|DEAD' | head -1)"
 echo "评测 job 最终状态: ${STATUS}" >&2
 case "${STATUS}" in
-  *SUCCEEDED*) : ;;
-  *) echo "错误: 评测 job 未成功 (status=${STATUS})" >&2; exit 5 ;;
+  SUCCEEDED) : ;;
+  *) echo "错误: 评测 job 未成功 (status=${STATUS:-UNKNOWN})" >&2; exit 5 ;;
 esac
 
 "${SLIME_PYTHON}" -m examples.ShopSimulator.summarize_eval --run-root "${RUN_ROOT}"
