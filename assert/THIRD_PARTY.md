@@ -20,7 +20,7 @@ The upstream license is preserved at `slime/LICENSE`. The reviewed modification 
 - Upstream base revision: `51bb26012cee31aea7ac26177c5ffe807026ac07`
 - Tested modified revision: `3ab366b2982e9ffa59957086d0845f955ef2245b`
 - Vendored source: no
-- Patch: `shopsimulator_patch/shopsimulator-slime-integration.patch`
+- Patch: `assert/shopsimulator-slime-integration.patch`
 - Modification description: `README.md`
 
 The upstream repository did not declare an explicit software redistribution license when this workspace was created. This repository does not grant rights to the upstream ShopSimulator source. Obtain permission from its copyright holders before redistributing the complete modified source.
@@ -36,12 +36,9 @@ The upstream repository did not declare an explicit software redistribution lice
 
 Pi is installed as a pinned external dependency. The Shop-specific extension remains in the Slime integration code.
 
-## Qwen3.5-2B
+## Qwen3.5-0.8B
 
-- Base model: https://huggingface.co/Qwen/Qwen3.5-2B
+- Base model: https://huggingface.co/Qwen/Qwen3.5-0.8B
 - License: Apache-2.0
-- SFT model: https://huggingface.co/mrzhao13/qwen3.5-2b-shopsimulator-sft-512-1ep
-- GRPO/RL model: https://huggingface.co/mrzhao13/qwen3.5-2b-shopsimulator-grpo-rl500-1ep
-- Historical teacher dataset (private): https://huggingface.co/datasets/mrzhao13/pi-slime-shopsimulator-sft-512
 
-The base and trained model weights are not vendored in this Git repository. The model cards record their source, license, training details and artifact identities. Access to the private historical teacher dataset is not required because this repository includes the task slice and the complete collection/preparation workflow.
+The base model weights are not vendored in this Git repository; they are downloaded from the source above during setup (see `assert/INSTALL.md`, step 3). Trained artifacts are not redistributed here. No external dataset access is required because this repository includes the task slice and the complete teacher-data collection/preparation workflow.

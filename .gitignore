@@ -17,9 +17,16 @@
 **/node_modules/
 *.py[cod]
 
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
 # Training and evaluation artifacts
 /models/
 /data/
+/result/
 /outputs/
 /logs/
 /checkpoints/
@@ -28,6 +35,27 @@
 *.pt
 *.ckpt
 *.safetensors
+*.npy
+*.npz
+*.h5
+*.onnx
+*.gguf
+*.bin
+
+# Archives and misc
+*.tar
+*.tar.gz
+*.zip
+*.pid
+nohup.out
+
+# Empty placeholder at repo root (0 bytes, no purpose)
+/main.py
+
+# Local working documents (not meant for public upload)
+/TODO.md
+/PLAN.md
+/AGENT.md
 
 # Do not accidentally vendor the unlicensed upstream source
 /ShopSimulator/

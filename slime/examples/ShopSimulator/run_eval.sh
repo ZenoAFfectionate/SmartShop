@@ -12,7 +12,7 @@ SLIME_PYTHON="${SLIME_PYTHON:-${MAMBA_ROOT_PREFIX}/envs/slime/bin/python}"
 SLIME_BIN="${SLIME_BIN:-$(dirname "${SLIME_PYTHON}")}"
 RAY_BIN="${RAY_BIN:-${SLIME_BIN}/ray}"
 PI_BIN="${PI_BIN:-$(command -v pi || true)}"
-source "${SLIME_DIR}/scripts/models/qwen3.5-2B.sh"
+source "${SLIME_DIR}/scripts/models/qwen3.5-0.8B.sh"
 
 EVAL_CONFIG="${EVAL_CONFIG:-${SCRIPT_DIR}/config/shop_eval_official_k1.yaml}"
 SHOP_ENV_URL="${SHOP_ENV_URL:-http://127.0.0.1:5000/api/shop_agent}"
@@ -24,7 +24,9 @@ ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
 SEED="${SEED:-1234}"
 : "${EVAL_CHECKPOINT:?set EVAL_CHECKPOINT to a Hugging Face or Megatron checkpoint directory}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-${EVAL_CHECKPOINT}}"
-PROMPT_DATA="${SCRIPT_DIR}/data/tasks_v2/official_test_200.jsonl"
+# Overridable so non-default EVAL_CONFIGs can point at their own dataset
+# (e.g. shop_dev.yaml -> dev.jsonl for full development-set evaluation).
+PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/tasks_v2/official_test_200.jsonl}"
 
 [[ -n "${PI_BIN}" && -x "${PI_BIN}" ]] || { echo "pi is required; set PI_BIN to its executable" >&2; exit 2; }
 for required in "${SLIME_PYTHON}" "${MEGATRON_DIR}" "${EVAL_CHECKPOINT}" "${HF_CHECKPOINT}" "${EVAL_CONFIG}" "${PROMPT_DATA}"; do
@@ -38,6 +40,11 @@ RAY_TEMP_DIR="${RAY_TEMP_DIR:-${BASE_DIR}/ray/eval}"
 ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-127.0.0.1}"
 ADAPTER_BIND_HOST="${ADAPTER_BIND_HOST:-0.0.0.0}"
 ADAPTER_PORT="${ADAPTER_PORT:-18080}"
+# Overridable so a second eval can run alongside an existing Ray cluster
+# (e.g. while an RL run holds the default 6379/8265 ports).
+RAY_GCS_PORT="${RAY_GCS_PORT:-6379}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
+RAY_ADDRESS="http://127.0.0.1:${RAY_DASHBOARD_PORT}"
 if [[ -e "${RUN_ROOT}" ]]; then
   echo "Refusing to overwrite existing RUN_ROOT: ${RUN_ROOT}" >&2
   exit 2
@@ -102,7 +109,7 @@ fi
 
 command -v nvidia-smi >/dev/null || { echo "nvidia-smi is required" >&2; exit 2; }
 [[ -x "${RAY_BIN}" ]] || { echo "ray is required: ${RAY_BIN}" >&2; exit 2; }
-if "${RAY_BIN}" status >/dev/null 2>&1; then
+if RAY_ADDRESS="${RAY_ADDRESS}" "${RAY_BIN}" status >/dev/null 2>&1; then
   echo "An existing Ray cluster is running; stop it first." >&2
   exit 2
 fi
@@ -116,6 +123,11 @@ export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export SHOP_ENV_URL SHOP_MAX_TURNS="${MAX_MODEL_TURNS}"
 export SHOP_CONTEXT_KEEP_ACT_RESULTS="${SHOP_CONTEXT_KEEP_ACT_RESULTS:-3}"
 export SHOP_ROLLOUT_TIMEOUT_SEC="${SHOP_ROLLOUT_TIMEOUT_SEC:-600}"
+# D5 non-RL baseline: optional ReAct-style system prompt override. Set
+# SHOP_SYSTEM_PROMPT (literal) or SHOP_SYSTEM_PROMPT_FILE (path) before
+# launching to evaluate the same checkpoint under different instructions.
+if [[ -n "${SHOP_SYSTEM_PROMPT:-}" ]]; then export SHOP_SYSTEM_PROMPT; fi
+if [[ -n "${SHOP_SYSTEM_PROMPT_FILE:-}" ]]; then export SHOP_SYSTEM_PROMPT_FILE; fi
 export ADAPTER_PUBLIC_HOST ADAPTER_BIND_HOST ADAPTER_PORT
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,${MASTER_ADDR},${ADAPTER_PUBLIC_HOST}}"
 export no_proxy="${no_proxy:-${NO_PROXY}}"
@@ -128,23 +140,79 @@ fi
 
 RAY_STARTED=0
 cleanup() {
+  # ray stop --force 是全局命令，并行评测时会误杀其他实验的 Ray 集群。
+  # RAY_KEEP_CLUSTER=1 时保留集群，改为提示手动清理。
   if (( RAY_STARTED == 1 )); then
-    "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+    if [[ "${RAY_KEEP_CLUSTER:-0}" == "1" ]]; then
+      echo "评测退出。Ray 集群保留（RAY_KEEP_CLUSTER=1），如需停止：" >&2
+      echo "  RAY_ADDRESS=${RAY_ADDRESS} ${RAY_BIN} stop --force" >&2
+    else
+      RAY_ADDRESS="${RAY_ADDRESS}" "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+    fi
   fi
 }
 trap cleanup EXIT INT TERM
 
 "${RAY_BIN}" start --head --node-ip-address "${MASTER_ADDR}" --num-gpus 1 \
-  --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port=8265 \
+  --port "${RAY_GCS_PORT}" --disable-usage-stats \
+  --dashboard-host=127.0.0.1 --dashboard-port="${RAY_DASHBOARD_PORT}" \
   --temp-dir "${RAY_TEMP_DIR}"
 RAY_STARTED=1
 
-RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","SHOP_ENV_URL","SHOP_MAX_TURNS","SHOP_CONTEXT_KEEP_ACT_RESULTS","SHOP_ROLLOUT_TIMEOUT_SEC","ADAPTER_PUBLIC_HOST","ADAPTER_BIND_HOST","ADAPTER_PORT","PI_BIN"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
+RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_VISIBLE_DEVICES","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","SHOP_ENV_URL","SHOP_MAX_TURNS","SHOP_CONTEXT_KEEP_ACT_RESULTS","SHOP_ROLLOUT_TIMEOUT_SEC","SHOP_SYSTEM_PROMPT","SHOP_SYSTEM_PROMPT_FILE","ADAPTER_PUBLIC_HOST","ADAPTER_BIND_HOST","ADAPTER_PORT","PI_BIN"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
+
+# 等待 Ray job agent 就绪（ray start 后 agent 需要数秒启动，
+# 过早 submit 会报 "No available agent to submit job" 500 错误）
+AGENT_READY=0
+for i in $(seq 1 36); do
+  if RAY_ADDRESS="${RAY_ADDRESS}" "${RAY_BIN}" job list >/dev/null 2>&1; then
+    echo "Ray job agent 就绪（等待了 $((i*5)) 秒）"
+    AGENT_READY=1
+    break
+  fi
+  echo "等待 Ray job agent 就绪... ($((i*5))s)"
+  sleep 5
+done
+if (( AGENT_READY != 1 )); then
+  echo "错误: Ray job agent 180 秒内未就绪，放弃 submit" >&2
+  exit 3
+fi
 
 cd "${SLIME_DIR}"
-"${RAY_BIN}" job submit --address=http://127.0.0.1:8265 \
-  --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}" 2>&1 | tee "${RUN_ROOT}/eval.log"
+# 提交评测 job：agent 未完全就绪时 submit 会报 500 "No available agent"，
+# dashboard 就绪(job list 成功)不代表 agent runtime 已注册，故带重试
+SUBMIT_OK=0
+for i in $(seq 1 10); do
+  # || true 防 set -e：submit 失败时靠 JOB_ID 判断，而非让脚本直接终止
+  SUBMIT_OUT="$("${RAY_BIN}" job submit --address="${RAY_ADDRESS}" \
+      --runtime-env-json="${RUNTIME_ENV_JSON}" --no-wait \
+      -- "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}" 2>&1 || true)"
+  echo "${SUBMIT_OUT}" | tail -4 >&2
+  # { grep || true; } 防 pipefail：grep 无匹配时退出码 1 会经管道触发 set -e
+  JOB_ID="$(printf '%s' "${SUBMIT_OUT}" | { grep -oE 'raysubmit_[A-Za-z0-9]+' || true; } | tail -1)"
+  if [[ -n "${JOB_ID}" ]]; then
+    SUBMIT_OK=1
+    break
+  fi
+  echo "job submit 失败（第 $i/10 次，agent 可能未就绪），15 秒后重试..." >&2
+  sleep 15
+done
+if (( SUBMIT_OK != 1 )); then
+  echo "错误: job submit 重试 10 次均失败" >&2
+  exit 4
+fi
+echo "评测 job 已提交: ${JOB_ID}"
+
+# 跟踪 job 日志直至结束（--follow 阻塞到 job 完成）
+"${RAY_BIN}" job logs --address="${RAY_ADDRESS}" --follow "${JOB_ID}" 2>&1 | tee "${RUN_ROOT}/eval.log"
+
+# 以 job 最终状态判定成败（job 运行失败不重试，只有提交失败才重试）
+STATUS="$("${RAY_BIN}" job status "${JOB_ID}" --address="${RAY_ADDRESS}" 2>/dev/null | tail -1)"
+echo "评测 job 最终状态: ${STATUS}" >&2
+case "${STATUS}" in
+  *SUCCEEDED*) : ;;
+  *) echo "错误: 评测 job 未成功 (status=${STATUS})" >&2; exit 5 ;;
+esac
 
 "${SLIME_PYTHON}" -m examples.ShopSimulator.summarize_eval --run-root "${RUN_ROOT}"
 printf 'Evaluation complete. Results: %s\n' "${RUN_ROOT}/eval_results.json"

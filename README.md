@@ -1,240 +1,179 @@
-# Pi + Slime + ShopSimulator
+# 🛍️ SmartShop · 慧购
 
-本目录提供 Qwen3.5-2B + Pi + Slime + ShopSimulator 的最小训练参考实现，覆盖 512-task 教师数据采集、SFT、在线 GRPO 和单次 rollout 评测。当前版本不锁定数据、模型、环境或产物 SHA，也不承诺与我们的历史运行逐项一致。
+<div align="center">
 
-## 历史实验结果（仅供参考）
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Model: Qwen3.5-0.8B](https://img.shields.io/badge/Model-Qwen3.5--0.8B-blue.svg)](#)
+[![Framework: Slime + SGLang](https://img.shields.io/badge/Framework-Slime%20%2B%20SGLang-9cf.svg)](#)
+[![PyTorch 2.11](https://img.shields.io/badge/PyTorch-2.11-ee4c2c.svg)](#)
+[![Status: Experimental](https://img.shields.io/badge/Status-Experimental-orange.svg)](#)
 
-以下结果来自精简发布目录之前的一次内部运行。它们用于展示这条训练路线在当时软硬件、依赖版本、数据采样和 checkpoint 下的效果，不是当前代码的复现承诺。
+**用在线强化学习（GRPO）把 0.8B 小模型训练成自主购物 Agent**
 
-对应的 Hugging Face 发布产物：
+</div>
 
-- SFT 数据集（私有）：[`mrzhao13/pi-slime-shopsimulator-sft-512`](https://huggingface.co/datasets/mrzhao13/pi-slime-shopsimulator-sft-512)
-- SFT 模型（公开）：[`mrzhao13/qwen3.5-2b-shopsimulator-sft-512-1ep`](https://huggingface.co/mrzhao13/qwen3.5-2b-shopsimulator-sft-512-1ep)
-- GRPO/RL 模型（公开）：[`mrzhao13/qwen3.5-2b-shopsimulator-grpo-rl500-1ep`](https://huggingface.co/mrzhao13/qwen3.5-2b-shopsimulator-grpo-rl500-1ep)
+基于 **Qwen3.5-0.8B + Pi Agent + Slime + ShopSimulator** 的最小训练参考实现，覆盖「512-task 教师数据采集 → 全量 SFT → 在线 GRPO → 单次 rollout 评测」的完整 agentic RL 流水线。仅用 0.8B 参数，在线 RL 后严格成功率从 19.0% 提升至 **34.0%**（+15pt）。
 
-私有 SFT 数据集仅用于归档历史运行中通过筛选的教师数据，不是运行本仓库流程的前置依赖；实验 1 会从内置 `sft_512` 任务重新采集和准备 SFT 数据。
+![SmartShop · 慧购 整体流程](assert/overview.jpg)
 
-| 阶段 | 当时的运行结果 |
-| --- | --- |
-| 512-task 教师采集 | 512 个任务各采集 1 条；412 条轨迹通过筛选，task 覆盖率 80.5%；转换得到 6153 个 turn-level SFT 样本。 |
-| SFT | 6153 个样本完整训练 1 epoch，共 2051 个 optimizer step；生成 HF 与 Megatron checkpoint。 |
-| 在线 GRPO | `rl_500` 训练 1 epoch：500 个 group、2000 个 candidate、100 个 rollout/optimizer step；352 个 group 具有非零 reward 方差。 |
-| 最终评测 | 在 `official_test_200` 上对 Base、SFT、RL 各做 200 次单样本 rollout；结果见下表。 |
+> **环境要求**：训练与评测需要 **Linux + NVIDIA GPU**（CUDA 12.9、PyTorch 2.11、SGLang、Megatron-LM）。macOS / Windows 无法运行训练流程，本地无 GPU 环境仅可浏览代码与结果。
+
+---
+
+## 📑 目录
+
+- [✨ 项目亮点](#-项目亮点)
+- [🧩 项目介绍与整体流程](#-项目介绍与整体流程)
+- [📊 实验结果](#-实验结果)
+- [🚀 快速开始](#-快速开始)
+- [📦 安装与配置](assert/INSTALL.md)
+- [⚖️ 许可与第三方](#️-许可与第三方)
+
+---
+
+## ✨ 项目亮点
+
+- 🎯 **小模型，大提升**：0.8B 模型经在线 GRPO 后严格成功率 19.0% → 34.0%，验证了小规模模型在 agentic RL 任务上的可行性。
+- 🧪 **完整四阶段流水线**：教师轨迹采集 → SFT → 在线 RL → 评测，全链路可复现。
+- 🔀 **多算法对照**：在同一 SFT checkpoint 上对比 GRPO / Dr.GRPO / GSPO / CISPO / REINFORCE++。
+- 🛡️ **三层质量门控**：采集期轨迹筛选、RL 期组校验归一化、评测期多维指标。
+- ⚙️ **工程化隔离**：并发会话隔离、确定性价格、Qwen3.5 loss mask 等关键工程处理。
+
+---
+
+## 🧩 项目介绍与整体流程
+
+### 这是什么项目
+
+用在线强化学习（GRPO）把 Qwen3.5-0.8B 这样一个 0.8B 参数的小模型，训练成能在 ShopSimulator 购物模拟环境中自主完成购物任务的 Agent：模型通过 `shop_reset` / `shop_act` 两个工具与环境多轮交互（搜索、浏览、比价、下单），直到任务结束并获得环境反馈的 reward。
+
+### 整体流程（四阶段）
+
+```
+阶段 1  教师数据采集（collect_sft.py + prepare_sft.py）
+        DeepSeek 教师模型驱动 Pi agent 在 512 个任务上采集轨迹
+        → 12 类规则筛选（reward 阈值 / 工具使用合法性 / 上下文轨迹一致性）
+        → 通过筛选的轨迹展开为 turn-level SFT 样本
+                │
+                ▼
+阶段 2  监督微调 SFT（run_sft.sh）
+        Qwen3.5-0.8B 在 turn-level 样本上全量训练 1 epoch
+                │
+                ▼
+阶段 3  在线强化学习 GRPO（run_rl.sh + generate.py）
+        被训练的模型本身作为 agent 在环境中在线 rollout
+        每个任务采样 4 个 candidate，组内归一化计算 advantage
+                │
+                ▼
+阶段 4  评测（run_eval.sh + summarize_eval.py）
+        在 official_test_200 上做 k=1 单次 rollout
+        输出 r_loose / r_hard / 严格成功率 / pass@1 等指标
+```
+
+### 核心架构：pi-harness 的双模式
+
+Pi（Node.js 编写的通用 coding agent CLI）在本项目中被当作通用的 agent 执行骨架使用：其内置编程工具被禁用，替换为 `shop_extension.ts` 注册的两个购物工具。同一套 harness（`pi_harness.py`）支持两种运行模式：
+
+| 模式 | 使用场景 | 模型请求去向 |
+| --- | --- | --- |
+| 教师模式 | 阶段 1 数据采集 | DeepSeek API |
+| 学生模式 | 阶段 3/4 RL rollout 与评测 | Slime OpenAI Adapter → SGLang → 被训练的 Qwen3.5-0.8B |
+
+学生模式下，被训练的模型就是 rollout 中的 agent 本体：Slime 框架捕获每一轮的 tokens、loss mask 与最终 reward，直接用于 GRPO 策略梯度更新。
+
+### 质量保障（三层门控）
+
+1. **轨迹筛选（采集期）**：reward 阈值、运行错误、工具序列合法性（`shop_reset` 恰好一次且最先）、上下文轨迹与重建快照一致性等 12 类拒绝原因；
+2. **组校验与归一化（RL 期）**：candidate 组完整性校验、reward 跨片段一致性、组内标准化与零方差检测；
+3. **多维指标（评测期）**：`r_type` / `r_att` / `r_option` / `r_price` 四个子分数与终止原因分布。
+
+### 关键工程点
+
+- **会话隔离**：每条 rollout 持有独立 `rollout_session_id`，20 槽环境池并发隔离，防止 Slime 并发采样互相覆盖状态；
+- **上下文一致性**：SFT 样本输入与 RL rollout 时模型实际上下文来自同一裁剪逻辑（保留最近 3 条 `shop_act` 结果），训练与部署分布对齐；
+- **确定性价格**：ShopSimulator 补丁使商品价格按 ASIN 确定性生成，避免 reward 因服务端随机性漂移；
+- **Qwen3.5 loss mask**：精确处理模板注入的空 think 块，多轮工具调用轨迹中只训练模型真实生成的 token。
+
+## 📊 实验结果
+
+以下为 **Qwen3.5-0.8B** 在本仓库流程下的评测结果（`official_test_200`，k=1 单次采样）。模型与数据产物暂未单独发布，全部结果可由本仓库工作流（实验 1–4）从基座模型完整复现。
+
+### 核心指标对照
 
 | 模型 | 正奖励 pass@1 | 严格成功 pass@1 | mean@1 `r_loose` | mean@1 `r_hard` |
 | --- | ---: | ---: | ---: | ---: |
-| Base | 2.0% | 0.0% | 0.004286 | 0.000000 |
-| SFT | 72.5% | 10.5% | 0.389829 | 0.124417 |
-| RL | 90.5% | 31.0% | 0.627786 | 0.354530 |
+| Base | 0.0% | 0.0% | 0.000000 | 0.000000 |
+| SFT | 69.5% | 19.0% | 0.443097 | 0.212067 |
+| **GRPO** | 88.0% | **34.0%** | 0.638131 | 0.377048 |
+| Dr.GRPO | 88.0% | 34.0% | 0.647307 | 0.387161 |
+| GSPO | 89.0% | 33.5% | 0.639476 | 0.381073 |
 
-精简后的示例会按实际输入行数运行，只保留必要的数据格式、loss mask、rollout 分组和 reward 一致性检查；固定 revision、工作树状态、manifest 身份、数据/checkpoint SHA 以及历史产物完整性检查均不再作为启动条件。
+> 算法变体（GRPO / Dr.GRPO / GSPO）之间的差异（±0.5pt）远小于评测噪声（CI ±3.3pt），**RL 本身才是 +15pt 的来源**。
 
-## ShopSimulator 相对基线的补丁
+### 完整指标表
 
-本仓库不复制或重新分发 ShopSimulator 源码，只提供一个相对于指定上游提交的补丁，用于构建与 Slime 集成的环境。
+| 模型 | 正奖励 pass@1 | 严格成功 | r_loose | r_hard | r_type | r_att | r_option | r_price | done 率 | 买对商品 | turn_limit 率 | 平均 turn 数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base | 0.0% | 0.0% | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.0% | 0.0% | 74.5% | 32.2 |
+| SFT | 69.5% | 19.0% | 0.443097 | 0.212067 | 0.710000 | 0.472319 | 0.230000 | 0.595000 | 71.0% | 29.5% | 27.5% | 23.6 |
+| GRPO | 88.0% | 34.0% | 0.638131 | 0.377048 | 0.905000 | 0.680938 | 0.408333 | 0.760000 | 90.5% | 40.5% | 9.0% | 13.3 |
+| Dr.GRPO | 88.0% | 34.0% | 0.647307 | 0.387161 | 0.895000 | 0.681560 | 0.430000 | 0.780000 | 89.5% | 45.0% | 10.0% | 12.9 |
+| GSPO | 89.0% | 33.5% | 0.639476 | 0.381073 | 0.910000 | 0.671067 | 0.413333 | 0.790000 | 91.0% | 41.0% | 9.0% | 14.3 |
 
-- 上游仓库：<https://github.com/ShopAgent-Team/ShopSimulator>
-- 固定补丁基线：`51bb26012cee31aea7ac26177c5ffe807026ac07`
-- 补丁对应的测试版本：`3ab366b2982e9ffa59957086d0845f955ef2245b`
-- 补丁文件：[`shopsimulator_patch/shopsimulator-slime-integration.patch`](shopsimulator_patch/shopsimulator-slime-integration.patch)
-- SHA-256：`c75973456391f8f7784e0823bde2eae5cd6f4ae519dae51d43ed5c8b86c19dac`
+> **解码方式与统计说明**：上表为 k=1、`temperature=1.0`、固定 rollout seed 的单次采样评测（非贪婪解码，也非多次运行均值——每个模型只运行一次）。n=200 下 90.5% 的 95% Wilson 置信区间约为 ±3.3%，小幅差距可能不具统计显著性。
 
-补丁是上述两个提交之间的完整 Git diff，包含 50 个文件的变化。除功能修改外，它还删除了上游提交中误跟踪的 Python 缓存和运行日志，因此体积约为 382 KiB。
+### 进行中的工作 🚧
 
-### 并发 rollout 与会话隔离
+- **CISPO**、**REINFORCE++**：正在同一 SFT checkpoint 上训练与评测，结果完成后将补充至上表。
 
-- 将 Flask API 改为线程化服务，并为环境池和单个环境增加锁。
-- 启动时预创建 20 个环境；这些环境共享只读的 `SimServer` 数据，避免重复加载商品和目标数据。
-- 为每条 rollout 引入独立的 `rollout_session_id`，将任务索引 `idx` 与会话标识分离。
-- `reset` 分配空闲环境，`interact` 校验环境和会话是否匹配，任务结束后自动释放环境和会话状态。
-- 完善 `release_one`、`release_all`，并增加 `status`，可查看容量、空闲环境和活动会话。
-- 环境分配后发生异常时自动回收资源，避免环境池泄漏。
+### 各阶段运行结果
 
-这些修改用于防止 Slime 并发采样时不同 rollout 共享或覆盖交互状态。
+| 阶段 | 运行结果 |
+| --- | --- |
+| 512-task 教师采集 | 512 个任务，采用过采样/补选确保**完整覆盖全部 512 个任务**（每任务 4-39 个 turn 样本，平均 13.9）；转换得到 **7128 个 turn-level SFT 样本**。 |
+| SFT | **Qwen3.5-0.8B** 在 7128 个样本上完整训练 1 epoch，共 1782 个 optimizer step（`GLOBAL_BATCH_SIZE=4`、`MAX_TOKENS_PER_GPU=16384`）；生成 HF 与 Megatron checkpoint。 |
+| 在线 GRPO | `rl_500` 训练 1 epoch：500 个 group、2000 个 candidate、100 个 rollout/optimizer step；352 个 group 具有非零 reward 方差。0.8B 已完整运行 100 rollout（中途从 `iter_0000049` 断点续训一次）。 |
+| 算法对照 | 在同一 SFT checkpoint 上额外训练 Dr.GRPO（GRPO 去除 advantage 的 std 归一化）与 GSPO 两个变体（各 100 rollout），用于对比算法效率与效果。 |
+| 最终评测 | 在 `official_test_200` 上对 Base、SFT、GRPO、Dr.GRPO、GSPO 各做 200 次单样本 rollout（解码：sampling, T=1.0, k=1）；结果见上表。 |
 
-### 可复现的价格与价格约束
+### 指标定义（依据 ShopSimulator 论文，arXiv:2601.18225）
 
-- 商品价格不再依赖进程级全局随机状态，而是根据商品 ASIN 确定性生成。
-- 目标中的 `price_upper` 根据 ASIN 和 instruction 确定性生成。
-- 同一任务在不同服务进程、环境实例和多次启动中使用相同价格数据，避免 `r_price` 与 `r_hard` 因服务端随机性漂移。
+环境在任务终止时返回四个子分数，本项目在此之上汇总出两级标量奖励：
 
-### 文本环境适配
+| 子分数 | 定义 |
+| --- | --- |
+| `r_type` | 类别软匹配分：初始搜索一致 / 类别路径共享 ≥2 节点 / 标题关键词重合率 >0.2 三条判据任一满足取 1.0，否则 0.5；标题相似度过低降至 0.1 或 0 |
+| `r_att` | 属性匹配率：购买商品语义属性（材质/功能/风格）与目标的匹配比例，模糊匹配且计入标题与描述 |
+| `r_option` | 选项匹配率：配置选项（颜色/尺码/容量）与目标的匹配比例，模糊匹配 |
+| `r_price` | 价格约束指示函数：购买价 ≤ 目标价格上限为 1，否则 0 |
 
-- 修正自定义字符串会话下任务索引的传递，确保目标仍由请求中的 `idx` 选择。
-- 增加单会话状态释放接口，只清理该 rollout 的可变状态。
-- 文本 API 的空图像占位改用 NumPy，去除该路径对 Torch 的非必要依赖。
+- **`r_loose`（环境返回的标量 `reward`）**：加法奖励，
+  `r_type × (|U_att∩Y_att| + |U_opt∩Y_opt| + 1[Y_price≤U_price]) / (|U_att| + |U_opt| + 1)`，
+  其中 `U_*` 为目标商品的属性/选项集合与价格上限，`Y_*` 为购买商品的对应项。
+  部分满足即可得部分奖励，取值 [0,1]。
+- **`r_hard`（本仓库 `common.py` 计算）**：乘法奖励（论文的 strict 变体），
+  `r_type × r_att × r_option × r_price` 四项连乘，任一维度不满足则整体趋零，
+  与"严格成功"（四子项全 1）同向。
 
-### 运行依赖与仓库清理
+计算细节以 ShopSimulator 上游源码为准（本仓库不含其源码，见 [assert/THIRD_PARTY.md](assert/THIRD_PARTY.md)）。
 
-- 新增 `shop_env/requirements.runtime.txt`，记录本项目使用的 Python 运行依赖版本。
-- 新增 `.gitignore`，忽略 Python 缓存、日志、PID 和本地编辑器状态。
-- 从版本控制快照中删除已提交的 `__pycache__`、`.pyc` 和 `shop_agent.log` 等运行产物。
+---
 
-### 补丁校验与使用
-
-完整的 ShopSimulator 获取、基线检出、补丁校验/应用、运行依赖安装和服务启动命令只在后文“[从 clone 开始运行四个实验](#从-clone-开始运行四个实验)”的第 2 步维护。应用前请同时核对上述基线 revision 和补丁 SHA-256；不要在其他 ShopSimulator 版本上强制应用。
-
-### 许可边界
-
-该补丁只描述本项目对指定 ShopSimulator 快照所做的差异，不包含完整上游源码，也不替代或变更上游项目的许可条款。使用者应自行查看上游仓库当前的许可与使用条件，并确保其获取、使用和分发行为拥有相应授权。
-
-## Slime 相对固定官方基线的修改
-
-本节固定以本项目当时 fork Slime 时使用的官方提交为比较基准，不跟随 Slime 上游后续更新：
-
-- 官方仓库：<https://github.com/THUDM/slime>
-- 固定官方基线：`624b824a898ab0ec1fcb4d373004c7f3852bf515`（2026-08-21，`[NFC] Add observability subfolder (#2298)`）
-- 本仓库中的修改后源码：[`slime/`](slime/)
-
-后续即使官方仓库发生更新，也不应在未重新审查兼容性和冲突的情况下替换上述基线。下面列出的内容均指当前 `slime/` 相对该固定提交的修改。
-
-### 新增 ShopSimulator 实验示例
-
-固定官方基线中没有 `examples/ShopSimulator/`。本项目新增了该目录及以下能力：
-
-- 新增 `pi_harness.py`、`shop_extension.ts`、`generate.py` 和 `common.py`，将 Pi 多轮工具调用、ShopSimulator HTTP API、Slime rollout 和 reward 计算连接起来。
-- 新增 `collect_sft.py` 与 `prepare_sft.py`，用于采集教师轨迹并转换为 turn-level SFT 数据。
-- 新增 `run_sft.sh`，提供 Qwen3.5-2B 的 SFT 训练入口。
-- 新增 `run_rl.sh` 与 `config/shop_rl.json`，提供基于 ShopSimulator 在线 rollout 的 GRPO 训练入口。
-- 新增 `run_eval.sh`、`config/shop_eval_official_k1.yaml` 与 `summarize_eval.py`，提供单次 rollout 评测及指标汇总入口。
-- 新增 `data/tasks_v2/` 下的 `sft`、`rl`、`dev`、`official_test` 四个任务池，以及实验入口使用的 `sft_512`、`rl_500` 和 `official_test_200` 数据文件。
-
-### Qwen3.5-2B 与 checkpoint 兼容
-
-- 新增 `scripts/models/qwen3.5-2B.sh`，补充 Qwen3.5-2B 在 Megatron 中使用的模型结构参数。
-- 调整 `tools/convert_hf_to_torch_dist.py`：仅在 Megatron 参数解析器尚未注册时添加 `--use-gated-attention` 和 `--padded-vocab-size`，避免新版本 Megatron 因重复参数定义退出，同时保持旧版本兼容。
-
-### Qwen3.5 loss mask 与空 think 块
-
-- 修正 `slime/utils/mask_utils.py` 对 Qwen3.5 chat template 的处理。
-- thinking 关闭时，模板注入的完整空块 `<think>\n\n</think>\n\n` 被视为 prompt，不参与 loss。
-- thinking 开启时，只屏蔽模板注入的 `<think>\n` 前缀；模型生成的 reasoning 内容继续参与训练。
-- 该修改不改变 token 序列，只修正训练 mask 的起点，并继续检查文本 tokenization 与 `apply_chat_template(..., tokenize=True)` 的结果一致。
-
-### 多轮 adapter 的终止状态
-
-- 在 `slime/agent/adapters/common.py` 中暴露每个 session 已完成并写入 trajectory 的真实模型 turn 数。
-- 为 turn 上限增加结构化的 `turn_limit` 终止原因，供 ShopSimulator rollout 区分正常达到上限与其他 429 或基础设施异常。
-- session 打开、完成或丢弃时清理 turn 计数与终止原因，避免复用 session id 时残留旧状态。
-
-### 安装与测试兼容
-
-- 调整 `build_conda.sh`，支持在无交互 AutoDL 会话中直接初始化或复用 micromamba，避免依赖 shell 启动脚本，并可复用已存在的 `slime` 环境。
-- 更新 adapter 测试，验证真实 turn 数、`turn_limit` 原因及 session 清理。
-- CPU-only agent rollout 测试仅在本机确实没有安装 `transformers` 时注入 stub，避免覆盖已经可用的真实包。
-
-## 从 clone 开始运行四个实验
+## 🚀 快速开始
 
 下面的命令按“512-task 教师数据采集 → 全量 SFT → `rl_500` GRPO → `official_test_200` 单次 rollout 评测”的顺序执行。
 
-当前启动配置面向单机单卡 NVIDIA GPU；历史运行使用 84 GB 显存的 Pro 6000D，训练侧 `MAX_TOKENS_PER_GPU=12288`。更小显存配置需要重新调整 token budget、batch size 和 SGLang 显存比例，本仓库尚未验证。
-
-### 0. 克隆仓库并定义路径
-
-```bash
-git clone https://github.com/Piucente/pi-slime-shopsimulator.git
-cd pi-slime-shopsimulator
-
-export PROJECT_ROOT="$PWD"
-export THIRD_PARTY_ROOT=/absolute/path/to/pi-slime-work
-export SLIME_DIR="$PROJECT_ROOT/slime"
-export MAMBA_ROOT_PREFIX="$THIRD_PARTY_ROOT/micromamba"
-export MAMBA_EXE=/root/.local/bin/micromamba
-export BASE_DIR="$THIRD_PARTY_ROOT"
-
-mkdir -p "$THIRD_PARTY_ROOT"
-```
-
-`THIRD_PARTY_ROOT` 用于放置 micromamba、SGLang、Megatron-LM 和 ShopSimulator；不要把这些运行环境目录提交到本仓库。非 root 用户应把 `MAMBA_EXE` 改为自己的 micromamba 安装位置。
-
-### 1. 安装 Pi 与 Slime 训练环境
-
-先准备 Node.js `>=22.19.0`，再安装本项目使用的 Pi 版本：
-
-```bash
-node --version
-npm --version
-npm install --global @earendil-works/pi-coding-agent@0.84.2
-
-export PI_BIN="$(command -v pi)"
-"$PI_BIN" --version
-```
-
-然后运行修改后的 Slime 安装脚本。它会创建或复用名为 `slime` 的 micromamba 环境，在 `THIRD_PARTY_ROOT` 下检出脚本固定的 SGLang 与 Megatron-LM revision，并安装 CUDA 12.9、PyTorch 2.11 和相应依赖：
-
-```bash
-export SLIME_DIR="$PROJECT_ROOT/slime"
-export BASE_DIR="$THIRD_PARTY_ROOT"
-export MAMBA_ROOT_PREFIX="$THIRD_PARTY_ROOT/micromamba"
-export MAMBA_EXE=/root/.local/bin/micromamba
-
-bash "$SLIME_DIR/build_conda.sh"
-
-export SLIME_PYTHON="$MAMBA_ROOT_PREFIX/envs/slime/bin/python"
-export MEGATRON_DIR="$THIRD_PARTY_ROOT/Megatron-LM"
-
-"$SLIME_PYTHON" -c 'import ray, sglang, torch; print(torch.__version__, torch.version.cuda)'
-```
-
-`build_conda.sh` 会下载依赖、编译 CUDA 扩展并修改它检出的 SGLang/Megatron-LM 工作树，耗时较长。后续命令都应继续使用这里的 `SLIME_PYTHON` 和 `MEGATRON_DIR`。
-
-### 2. 获取、打补丁并启动 ShopSimulator
-
-```bash
-export SHOP_SIM_DIR="$THIRD_PARTY_ROOT/ShopSimulator"
-
-git clone https://github.com/ShopAgent-Team/ShopSimulator.git "$SHOP_SIM_DIR"
-git -C "$SHOP_SIM_DIR" checkout 51bb26012cee31aea7ac26177c5ffe807026ac07
-git -C "$SHOP_SIM_DIR" apply --check "$PROJECT_ROOT/shopsimulator_patch/shopsimulator-slime-integration.patch"
-git -C "$SHOP_SIM_DIR" apply "$PROJECT_ROOT/shopsimulator_patch/shopsimulator-slime-integration.patch"
-
-"$SLIME_PYTHON" -m pip install -r "$SHOP_SIM_DIR/shop_env/requirements.runtime.txt"
-```
-
-在单独终端启动服务，并在教师采集、GRPO 和评测期间保持运行：
-
-```bash
-cd "$SHOP_SIM_DIR/shop_env"
-"$SLIME_PYTHON" shop_env/pack_api.py
-```
-
-在另一个终端确认 20-slot 环境池可用：
-
-```bash
-curl -sS -X POST http://127.0.0.1:5000/api/shop_agent \
-  -H 'content-type: application/json' \
-  --data '{"action":"status"}'
-```
-
-### 3. 准备 Qwen3.5-2B 的两种 checkpoint
-
-四个实验使用同一份基础模型。先下载 [`Qwen/Qwen3.5-2B`](https://huggingface.co/Qwen/Qwen3.5-2B)，再转换出训练侧使用的 Megatron `torch_dist` checkpoint：
-
-```bash
-mkdir -p "$THIRD_PARTY_ROOT/models"
-export HF_CLI="$MAMBA_ROOT_PREFIX/envs/slime/bin/hf"
-export BASE_HF_CHECKPOINT="$THIRD_PARTY_ROOT/models/Qwen3.5-2B"
-export BASE_MEGATRON_CHECKPOINT="$THIRD_PARTY_ROOT/models/Qwen3.5-2B_torch_dist"
-
-"$HF_CLI" download Qwen/Qwen3.5-2B --local-dir "$BASE_HF_CHECKPOINT"
-
-cd "$SLIME_DIR"
-source scripts/models/qwen3.5-2B.sh
-PYTHONPATH="$MEGATRON_DIR:$SLIME_DIR" "$SLIME_PYTHON" tools/convert_hf_to_torch_dist.py "${MODEL_ARGS[@]}" --hf-checkpoint "$BASE_HF_CHECKPOINT" --save "$BASE_MEGATRON_CHECKPOINT"
-```
-
-HF checkpoint 提供 tokenizer 和 SGLang rollout 权重，Megatron checkpoint 提供训练权重；SFT、RL 和评测启动器需要成对传入匹配的两种格式。
+> 环境初始化与配置（克隆仓库、安装 Pi 与 Slime、获取并打补丁启动 ShopSimulator、准备 checkpoint）详见 [INSTALL.md](assert/INSTALL.md)。
 
 ### 实验 1：采集 `sft_512` 教师数据
 
-教师采集默认读取仓库中的 `sft_512.jsonl`，每个任务采集一次，并使用 DeepSeek 兼容 API。仓库提供 `deepseek_api_key.example.txt`，它只包含占位符；不要直接在示例文件中填写真实 key。先将它复制到仓库外，真实 API key 只写在新文件的第一行：
+教师采集默认读取仓库中的 `sft_512.jsonl`，每个任务采集一次，并使用 DeepSeek 兼容 API。创建一个文本文件，第一行写真实 API key（不要提交到仓库）：
 
 ```bash
 export TEACHER_API_KEY_FILE="$THIRD_PARTY_ROOT/deepseek_api_key.txt"
-cp -n "$SLIME_DIR/examples/ShopSimulator/deepseek_api_key.example.txt" "$TEACHER_API_KEY_FILE"
 chmod 600 "$TEACHER_API_KEY_FILE"
 
-# 用文本编辑器把第一行替换为真实 API key。
+# 用文本编辑器把第一行写入真实 API key。
 export SFT_DATA_ROOT=/absolute/path/to/runs/shop_sft_512
 
 cd "$SLIME_DIR"
@@ -356,19 +295,9 @@ bash "$SLIME_DIR/examples/ShopSimulator/run_eval.sh"
 
 每次评测的完整结果分别写入对应 `RUN_ROOT/eval_results.json`，其中包含 `r_loose`、`r_hard`、严格成功率、正奖励 pass@1、终止原因和逐任务记录。这里只运行评测，不会更新模型权重。
 
-## 当前结构
+## ⚖️ 许可与第三方
 
-- `slime/`：相对上述固定官方基线修改后的 Slime 源码快照；ShopSimulator 示例仅保留四条主流程所需代码、配置和数据。
-- `shopsimulator_patch/shopsimulator-slime-integration.patch`：基于固定上游 revision 的单一 ShopSimulator 补丁；不分发上游完整源码。
-- `README.md`：项目说明、相对基线的修改以及四个实验的完整运行流程。
-- `CHANGES.md`：相对上游修改的摘要。
-- `THIRD_PARTY.md`：第三方项目的来源、固定版本和许可边界。
-- `repro.lock.json`：本项目使用的主要依赖与 revision 记录。
-- `LICENSE`：本项目原创内容采用的 MIT License。
-
-## 重要说明
-
-ShopSimulator 上游当前未声明明确的软件再分发许可证，因此本临时结构不包含其完整源码。来源、固定 revision 和许可证状态见 `THIRD_PARTY.md`。
+ShopSimulator 上游当前未声明明确的软件再分发许可证，因此本临时结构不包含其完整源码。来源、固定 revision 和许可证状态见 [assert/THIRD_PARTY.md](assert/THIRD_PARTY.md)。
 
 根目录 MIT License 仅覆盖本项目有权许可的原创代码和文档，不会改变第三方组件的许可证。内置 Slime 快照继续遵循 `slime/LICENSE` 中的 Apache-2.0；ShopSimulator 补丁也不授予对其上游源码的额外权利。
 

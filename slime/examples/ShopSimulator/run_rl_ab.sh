@@ -90,17 +90,33 @@ fi
 NUM_ROLLOUTS=$((DATA_ROWS / ROLLOUT_BATCH_SIZE))
 TOTAL_ROLLOUTS=$((NUM_ROLLOUTS * NUM_EPOCH))
 SGLANG_SERVER_CONCURRENCY=$((SHOP_ENV_CAPACITY / ROLLOUT_NUM_ENGINES))
+# C2: checkpoint every N rollouts (25 by default) so dev-based model selection
+# has candidates to choose from; the final rollout always saves too.
+SAVE_INTERVAL="${SAVE_INTERVAL:-25}"
+if (( SAVE_INTERVAL <= 0 )); then
+  echo "SAVE_INTERVAL must be positive" >&2
+  exit 2
+fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUNS_ROOT="${RUNS_ROOT:-${BASE_DIR}/slime-runs}"
 RUN_ROOT="${RUN_ROOT:-${RUNS_ROOT}/qwen35_2b_shop_rl_${STAMP}}"
 RAY_TEMP_DIR="${RAY_TEMP_DIR:-${BASE_DIR}/ray/rl}"
+# 多实验并行隔离：每个实验用独立的 Ray 端口与 adapter 端口
+RAY_GCS_PORT="${RAY_GCS_PORT:-6379}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
+RAY_ADDRESS="http://127.0.0.1:${RAY_DASHBOARD_PORT}"
+# GPU 隔离：限定本实验可见的 GPU（如 CUDA_VISIBLE_DEVICES=1）
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-127.0.0.1}"
 ADAPTER_BIND_HOST="${ADAPTER_BIND_HOST:-0.0.0.0}"
 ADAPTER_PORT="${ADAPTER_PORT:-18080}"
-# RESUME=1 允许复用已存在的 RUN_ROOT（从 checkpoint 续训）
-if [[ -e "${RUN_ROOT}" ]] && [[ "${RESUME:-0}" != "1" ]]; then
-  echo "Refusing to overwrite existing RUN_ROOT: ${RUN_ROOT} (set RESUME=1 to resume)" >&2
+# 算法切换：grpo / gspo / cispo / reinforce_plus_plus[_baseline] / ppo
+ADVANTAGE_ESTIMATOR="${ADVANTAGE_ESTIMATOR:-grpo}"
+# Dr. GRPO：置 1 则去掉 GRPO 的 std 归一化（消除难度偏差）
+DISABLE_GRPO_STD_NORMALIZATION="${DISABLE_GRPO_STD_NORMALIZATION:-0}"
+if [[ -e "${RUN_ROOT}" ]]; then
+  echo "Refusing to overwrite existing RUN_ROOT: ${RUN_ROOT}" >&2
   exit 2
 fi
 mkdir -p "${RUN_ROOT}/checkpoints" "${RUN_ROOT}/hf" "${RUN_ROOT}/rollout_dumps" "${RAY_TEMP_DIR}"
@@ -111,10 +127,9 @@ TRAIN_ARGS=(
   "${MODEL_ARGS[@]}"
   --hf-checkpoint "${HF_CHECKPOINT}"
   --ref-load "${REF_MODEL_PATH}"
-  --load "${LOAD_FROM:-${RUN_ROOT}/checkpoints}"
-  --start-rollout-id "${START_ROLLOUT_ID:-0}"
+  --load "${RUN_ROOT}/checkpoints"
   --save "${RUN_ROOT}/checkpoints"
-  --save-interval "${TOTAL_ROLLOUTS}"
+  --save-interval "${SAVE_INTERVAL}"
   --save-hf "${RUN_ROOT}/hf/rollout_{rollout_id}"
   --no-save-optim
   --no-save-rng
@@ -140,7 +155,7 @@ TRAIN_ARGS=(
   --balance-data
   --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
   --loss-type policy_loss
-  --advantage-estimator grpo
+  --advantage-estimator "${ADVANTAGE_ESTIMATOR}"
   --use-kl-loss
   --kl-loss-coef "${KL_COEF}"
   --kl-loss-type "${KL_TYPE}"
@@ -182,6 +197,18 @@ TRAIN_ARGS=(
   --colocate
 )
 
+# 可选：Dr. GRPO —— 去掉 advantage 的 std 归一化
+if [[ "${DISABLE_GRPO_STD_NORMALIZATION}" == "1" ]]; then
+  TRAIN_ARGS+=(--disable-grpo-std-normalization)
+fi
+
+# REINFORCE++ 变体要求开启 advantage 归一化（slime 强制校验，缺失会 assert 失败）
+case "${ADVANTAGE_ESTIMATOR}" in
+  reinforce_plus_plus|reinforce_plus_plus_baseline)
+    TRAIN_ARGS+=(--normalize-advantages)
+    ;;
+esac
+
 {
   printf '%q ' "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}"
   printf '\n'
@@ -195,8 +222,9 @@ fi
 
 command -v nvidia-smi >/dev/null || { echo "nvidia-smi is required" >&2; exit 2; }
 [[ -x "${RAY_BIN}" ]] || { echo "ray is required: ${RAY_BIN}" >&2; exit 2; }
-if "${RAY_BIN}" status >/dev/null 2>&1; then
-  echo "An existing Ray cluster is running; stop it first." >&2
+# 只检查本实验自己端口上的 Ray 集群，避免误判其他实验的集群
+if RAY_ADDRESS="${RAY_ADDRESS}" "${RAY_BIN}" status >/dev/null 2>&1; then
+  echo "An existing Ray cluster is running on ${RAY_ADDRESS}; stop it first." >&2
   exit 2
 fi
 
@@ -222,21 +250,51 @@ fi
 
 RAY_STARTED=0
 cleanup() {
+  # ray stop --force 是全局命令，会杀死机器上所有 Ray 集群（包括其他实验的）。
+  # 并行模式下默认不自动 stop，改为提示手动清理，避免误伤其他实验。
   if (( RAY_STARTED == 1 )); then
-    "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+    if [[ "${RAY_KEEP_CLUSTER:-0}" == "1" ]]; then
+      echo "实验退出。Ray 集群保留（RAY_KEEP_CLUSTER=1），如需停止请手动执行：" >&2
+      echo "  RAY_ADDRESS=${RAY_ADDRESS} ${RAY_BIN} stop --force" >&2
+    else
+      echo "警告: ray stop 将停止本机所有 Ray 集群！" >&2
+      "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+    fi
   fi
 }
 trap cleanup EXIT INT TERM
 
 "${RAY_BIN}" start --head --node-ip-address "${MASTER_ADDR}" --num-gpus 1 \
-  --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port=8265 \
+  --port "${RAY_GCS_PORT}" --disable-usage-stats \
+  --dashboard-host=127.0.0.1 --dashboard-port="${RAY_DASHBOARD_PORT}" \
   --temp-dir "${RAY_TEMP_DIR}"
 RAY_STARTED=1
+if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
+  echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} (本实验可见 GPU)"
+fi
 
-RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","SHOP_ENV_URL","SHOP_MAX_TURNS","SHOP_CONTEXT_KEEP_ACT_RESULTS","SHOP_ROLLOUT_TIMEOUT_SEC","SHOP_REQUIRE_NONZERO_VARIANCE_PER_ROLLOUT","ADAPTER_PUBLIC_HOST","ADAPTER_BIND_HOST","ADAPTER_PORT","PI_BIN"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
+RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_VISIBLE_DEVICES","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","SHOP_ENV_URL","SHOP_MAX_TURNS","SHOP_CONTEXT_KEEP_ACT_RESULTS","SHOP_ROLLOUT_TIMEOUT_SEC","SHOP_REQUIRE_NONZERO_VARIANCE_PER_ROLLOUT","ADAPTER_PUBLIC_HOST","ADAPTER_BIND_HOST","ADAPTER_PORT","PI_BIN"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
 
 cd "${SLIME_DIR}"
-"${RAY_BIN}" job submit --address=http://127.0.0.1:8265 \
+
+# 等待 Ray dashboard agent 就绪（ray start 后 agent 需要数秒启动，
+# 过早 submit 会报 "No available agent to submit job" 500 错误）
+AGENT_READY=0
+for i in $(seq 1 36); do
+  if "${RAY_BIN}" job list --address="${RAY_ADDRESS}" >/dev/null 2>&1; then
+    echo "Ray job agent 就绪（等待了 $((i*5)) 秒）"
+    AGENT_READY=1
+    break
+  fi
+  echo "等待 Ray job agent 就绪... ($((i*5))s)"
+  sleep 5
+done
+if (( AGENT_READY != 1 )); then
+  echo "错误: Ray job agent 180 秒内未就绪，放弃 submit" >&2
+  exit 3
+fi
+
+"${RAY_BIN}" job submit --address="${RAY_ADDRESS}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}" 2>&1 | tee "${RUN_ROOT}/train.log"
 

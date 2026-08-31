@@ -59,6 +59,10 @@ def summarize_dump(path: Path) -> dict[str, Any]:
             "termination_reason": metadata.get("termination_reason"),
             "error_kind": metadata.get("error_kind"),
             "error_message": metadata.get("error_message"),
+            # Slice dimensions for per-category / difficulty breakdowns (D1).
+            "category": metadata.get("category"),
+            "attribute_count": metadata.get("attribute_count"),
+            "option_count": metadata.get("option_count"),
         })
 
     return {
@@ -109,8 +113,22 @@ def summarize_run(run_root: Path) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path, help="summarize every eval dump below this run root")
+    parser.add_argument(
+        "--dump",
+        type=Path,
+        help="summarize a single rollout dump file (B2 mid-training inspection); "
+             "prints the summary without writing eval_results.json",
+    )
     args = parser.parse_args()
+    if args.dump is not None:
+        if args.run_root is not None:
+            parser.error("use either --run-root or --dump, not both")
+        summary = summarize_dump(args.dump)
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2))
+        return
+    if args.run_root is None:
+        parser.error("either --run-root or --dump is required")
     result = summarize_run(args.run_root)
     print(json.dumps(
         {key: value for key, value in result.items() if key != "records"},

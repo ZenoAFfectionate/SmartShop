@@ -18,6 +18,12 @@ if (!Number.isInteger(parsedKeepActResults) || parsedKeepActResults < 1) {
 }
 
 const PRUNED_SHOP_ACT_RESULT = "[旧的 shop_act 工具结果已裁剪；done=false]";
+// Error-classification prefixes. These MUST stay byte-identical to the Python
+// side in slime/examples/ShopSimulator/pi_harness.py (INFRASTRUCTURE_ERROR_PREFIX
+// / AGENT_ERROR_PREFIX, used by _classify_tool_error): the harness decides
+// "retry vs reject" based on these prefixes. A silent drift on either side
+// misclassifies agent errors as infrastructure errors (or vice versa).
+// Parity is enforced by tests/test_shopsimulator/test_f6_prefix_parity.py.
 const INFRASTRUCTURE_ERROR_PREFIX = "[shop_infrastructure]";
 const AGENT_ERROR_PREFIX = "[shop_agent]";
 

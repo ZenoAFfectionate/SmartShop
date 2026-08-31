@@ -33,6 +33,11 @@ class PiRunResult:
     purchase_asin: str | None = None
     goal_asin: str | None = None
     tool_calls: int = 0
+    # Model turns (one ``turn_start`` event per request to the model). This is
+    # the budget unit that matches the student-side adapter turn cap
+    # (``max_turns_per_sid`` in slime/agent/adapters/common.py): both count
+    # model requests, not individual tool executions.
+    model_turns: int = 0
     error: str | None = None
     error_kind: str | None = None
     tool_errors: list[dict[str, str]] = field(default_factory=list)
@@ -41,12 +46,40 @@ class PiRunResult:
 
 
 DEFAULT_EXTENSION = Path(__file__).with_name("shop_extension.ts")
+# Error-classification prefixes. These MUST stay byte-identical to the
+# TypeScript side in shop_extension.ts (INFRASTRUCTURE_ERROR_PREFIX /
+# AGENT_ERROR_PREFIX): the extension tags tool errors with them and
+# _classify_tool_error() maps the prefix to retry-vs-reject semantics here.
+# Parity is enforced by tests/test_shopsimulator/test_f6_prefix_parity.py.
 INFRASTRUCTURE_ERROR_PREFIX = "[shop_infrastructure]"
 AGENT_ERROR_PREFIX = "[shop_agent]"
 DEFAULT_SYSTEM_PROMPT = (
     "你是购物 Agent。先调用一次 shop_reset 获取任务，然后只使用 shop_act，"
     "以 ShopSimulator 原生动作 DSL 与环境交互，直到任务结束。"
+    "一旦找到与任务要求最匹配的商品，立即选择所需规格并点击购买；不要反复搜索。"
+    "任务以成功下单为结束标志；在完成购买前不要停止交互。"
 )
+
+
+def effective_system_prompt() -> str:
+    """Resolve the agent system prompt (D5 non-RL baseline support).
+
+    The default prompt is used unless overridden via environment:
+    - ``SHOP_SYSTEM_PROMPT``: the literal prompt text, or
+    - ``SHOP_SYSTEM_PROMPT_FILE``: path to a file whose contents are the prompt
+      (trailing whitespace stripped).
+
+    Overriding the prompt changes only the agent's instructions, not the
+    environment or the reward; this is how a ReAct-style non-RL baseline can
+    run against the same checkpoint with identical tooling.
+    """
+    text = os.environ.get("SHOP_SYSTEM_PROMPT")
+    if text:
+        return text
+    path = os.environ.get("SHOP_SYSTEM_PROMPT_FILE")
+    if path:
+        return Path(path).read_text(encoding="utf-8").strip()
+    return DEFAULT_SYSTEM_PROMPT
 
 # Keep the rollout harness independent from pi's user/project defaults.  CLI
 # discovery switches below are the primary guard; these settings also pin
@@ -97,9 +130,24 @@ def _is_terminal(result: PiRunResult) -> bool:
     return result.done or result.over
 
 
+def _effective_turns(result: PiRunResult) -> int:
+    """Turn-budget unit used by the harness cap.
+
+    Prefers model turns (``turn_start`` events), which match the student-side
+    adapter's ``max_turns_per_sid`` semantics exactly. Falls back to the raw
+    tool-call count when a pi build does not emit ``turn_start`` events, so the
+    cap still fires instead of relying on the wall-clock timeout alone.
+    """
+    return result.model_turns if result.model_turns > 0 else result.tool_calls
+
+
 def parse_pi_event(result: PiRunResult, event: dict) -> None:
     event_type = event.get("type")
-    if event_type == "tool_execution_end":
+    if event_type == "turn_start":
+        # One turn_start per model request; this is the turn-budget unit that
+        # matches the student-side adapter's max_turns_per_sid semantics.
+        result.model_turns += 1
+    elif event_type == "tool_execution_end":
         result.tool_calls += 1
         tool_name, details = _event_details(event)
         if isinstance(details.get("env_idx"), int):
@@ -172,30 +220,43 @@ async def run_pi(
     *,
     session_id: str,
     task_id: int,
-    adapter_url: str,
+    adapter_url: str | None,
     env_url: str,
     prompt: str,
     timeout_sec: float,
     pi_bin: str = "pi",
     extension: str | Path = DEFAULT_EXTENSION,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    system_prompt: str | None = None,
     provider_id: str = "slime-adapter",
-    model_id: str = "qwen3.5-2b",
-    model_name: str = "Qwen3.5-2B (Slime/SGLang)",
+    model_id: str = "qwen3.5-0.8b",
+    model_name: str = "Qwen3.5-0.8B (Slime/SGLang)",
     model_base_url: str | None = None,
     model_api_key: str | None = None,
     context_window: int = 262144,
     max_tokens: int = 32768,
     capture_events: bool = False,
     capture_event_types: set[str] | None = None,
-    max_tool_calls: int | None = None,
+    max_model_turns: int | None = None,
+    context_keep_act_results: int | None = None,
 ) -> PiRunResult:
+    if system_prompt is None:
+        system_prompt = effective_system_prompt()
+    if model_base_url is None and adapter_url is None:
+        raise ValueError(
+            "run_pi needs either model_base_url (teacher mode, e.g. a DeepSeek-"
+            "compatible endpoint) or adapter_url (student mode, the Slime "
+            "OpenAI adapter); neither was provided"
+        )
     env = os.environ.copy()
     env.update({
         "SHOP_ENV_URL": env_url,
         "SHOP_TASK_ID": str(task_id),
         "SHOP_ROLLOUT_SESSION_ID": session_id,
-        "SHOP_CONTEXT_KEEP_ACT_RESULTS": os.environ.get("SHOP_CONTEXT_KEEP_ACT_RESULTS", "3"),
+        "SHOP_CONTEXT_KEEP_ACT_RESULTS": str(
+            context_keep_act_results
+            if context_keep_act_results is not None
+            else os.environ.get("SHOP_CONTEXT_KEEP_ACT_RESULTS", "3")
+        ),
     })
     # Each worker may expose a different adapter host/port. Give pi an isolated
     # config so it cannot accidentally use the global ~/.pi baseUrl.
@@ -236,6 +297,8 @@ async def run_pi(
     env["PI_TELEMETRY"] = "0"
     local_hosts = {"127.0.0.1", "localhost"}
     for url in (adapter_url, env_url):
+        if url is None:
+            continue
         try:
             from urllib.parse import urlparse
 
@@ -294,8 +357,8 @@ async def run_pi(
                 parse_pi_event(parsed, event)
                 if _is_terminal(parsed):
                     terminal_event.set()
-                elif max_tool_calls is not None and parsed.tool_calls >= max_tool_calls:
-                    parsed.error = f"pi reached max tool calls ({max_tool_calls})"
+                elif max_model_turns is not None and _effective_turns(parsed) >= max_model_turns:
+                    parsed.error = f"pi reached max model turns ({max_model_turns})"
                     parsed.error_kind = "model_or_process_error"
                     terminal_event.set()
 

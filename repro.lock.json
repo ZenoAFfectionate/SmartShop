@@ -38,19 +38,8 @@
   },
   "models": {
     "base": {
-      "repository": "Qwen/Qwen3.5-2B",
+      "repository": "Qwen/Qwen3.5-0.8B",
       "license": "Apache-2.0"
-    },
-    "sft": {
-      "repository": "mrzhao13/qwen3.5-2b-shopsimulator-sft-512-1ep"
-    },
-    "grpo_rl": {
-      "repository": "mrzhao13/qwen3.5-2b-shopsimulator-grpo-rl500-1ep"
     }
-  },
-  "teacher_data": {
-    "repository": "mrzhao13/pi-slime-shopsimulator-sft-512",
-    "visibility": "private",
-    "required_for_workflow": false
   }
 }

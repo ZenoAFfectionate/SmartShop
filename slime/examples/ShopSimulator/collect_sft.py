@@ -13,7 +13,7 @@ from collections import Counter, deque
 from pathlib import Path
 from typing import Any
 
-from .pi_harness import DEFAULT_SYSTEM_PROMPT, InfrastructureError, run_pi
+from .pi_harness import DEFAULT_SYSTEM_PROMPT, InfrastructureError, effective_system_prompt, run_pi
 
 SCHEMA_VERSION = 1
 DEFAULT_PROMPT = "完成给定的购物任务。先调用 shop_reset，然后只使用 shop_act 与环境交互。"
@@ -246,6 +246,15 @@ async def collect_one(
     if destination.exists():
         return json.loads(destination.read_text(encoding="utf-8"))
 
+    keep_act_results = (
+        args.keep_act_results
+        if args.keep_act_results is not None
+        else int(os.environ.get("SHOP_CONTEXT_KEEP_ACT_RESULTS", "3"))
+    )
+    # Resolve once per candidate so messages, traces and the recorded harness
+    # metadata all reflect the same prompt (SHOP_SYSTEM_PROMPT[_FILE] aware).
+    system_prompt = effective_system_prompt()
+
     attempts: list[dict] = []
     final: dict[str, Any] | None = None
     for attempt in range(1, args.max_attempts + 1):
@@ -256,21 +265,25 @@ async def collect_one(
             result = await run_pi(
                 session_id=rollout_session_id,
                 task_id=task_id,
-                adapter_url="http://127.0.0.1:1",
+                # Teacher mode: pi talks straight to the provider base-url, so
+                # no Slime adapter exists to point at (None is explicit).
+                adapter_url=None,
                 env_url=args.env_url,
                 pi_bin=os.environ.get("PI_BIN", "pi"),
                 prompt=DEFAULT_PROMPT,
                 timeout_sec=args.timeout,
-                provider_id="deepseek",
+                provider_id=args.teacher_provider,
                 model_id=args.model,
                 model_name=args.model,
                 model_base_url=args.base_url,
                 model_api_key=api_key,
+                system_prompt=system_prompt,
                 context_window=args.context_window,
                 max_tokens=args.max_tokens,
                 capture_events=True,
                 capture_event_types=AUTHORITATIVE_EVENT_TYPES,
-                max_tool_calls=args.max_turns,
+                max_model_turns=args.max_turns,
+                context_keep_act_results=keep_act_results,
             )
             final = {
                 "exit_code": result.exit_code,
@@ -325,22 +338,22 @@ async def collect_one(
             "max_tokens": args.max_tokens,
         },
         "harness": {
-            "system_prompt": DEFAULT_SYSTEM_PROMPT,
-            "context_keep_act_results": int(os.environ.get("SHOP_CONTEXT_KEEP_ACT_RESULTS", "3")),
+            "system_prompt": system_prompt,
+            "context_keep_act_results": keep_act_results,
             "max_turns": args.max_turns,
             "timeout_sec": args.timeout,
         },
         "attempts": attempts,
         **final,
     }
-    candidate["messages"] = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}] + authoritative_messages(
+    candidate["messages"] = [{"role": "system", "content": system_prompt}] + authoritative_messages(
         candidate["events"]
     )
     reconstructed = context_snapshots(
-        candidate["messages"], candidate["harness"]["context_keep_act_results"]
+        candidate["messages"], keep_act_results
     )
     candidate["context_traces"] = normalize_context_traces(
-        candidate.get("context_traces") or [], DEFAULT_SYSTEM_PROMPT
+        candidate.get("context_traces") or [], system_prompt
     )
     candidate["context_snapshots"] = reconstructed
     candidate["context_trace_valid"] = context_trace_matches(
@@ -449,9 +462,14 @@ async def async_main(args: argparse.Namespace) -> dict:
             "planned_trajectories": len(rows) * args.samples_per_task,
         }
 
+    if args.api_key_file is None:
+        raise SystemExit(
+            "--api-key-file is required (no default; it previously pointed at "
+            "/root/api.txt, which silently picked up stale keys on root boxes)"
+        )
     api_key = args.api_key_file.read_text(encoding="utf-8").splitlines()[0].strip()
     if not api_key:
-        raise SystemExit("DeepSeek API key file first line is empty")
+        raise SystemExit("API key file first line is empty")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     limiter = LaunchRateLimiter(args.launches_per_minute)
@@ -486,8 +504,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Task JSONL to collect; defaults to the bundled 512-task SFT slice.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--api-key-file", type=Path, default=Path("/root/api.txt"))
+    parser.add_argument(
+        "--api-key-file",
+        type=Path,
+        default=None,
+        help="File whose first line is the teacher API key. Required unless --dry-run.",
+    )
     parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument(
+        "--teacher-provider",
+        default="deepseek",
+        help="Pi provider id for the teacher endpoint. Any OpenAI-compatible "
+             "base-url works, e.g. a local SGLang server for C5 "
+             "self-improvement sampling.",
+    )
     parser.add_argument("--base-url", default="https://api.deepseek.com")
     parser.add_argument("--env-url", default="http://127.0.0.1:5000/api/shop_agent")
     parser.add_argument("--task-ids-file", type=Path)
@@ -496,7 +526,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-limit", type=int, default=0, help="0 means all rows in --tasks")
     parser.add_argument("--samples-per-task", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--launches-per-minute", type=int, default=0)
+    parser.add_argument(
+        "--launches-per-minute",
+        type=int,
+        default=30,
+        help="Rate limit for rollout launches (pi may make several provider "
+             "requests per rollout). Default 30 avoids hammering the teacher "
+             "API; pass 0 to disable.",
+    )
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--retry-base-delay", type=float, default=2.0)
     parser.add_argument("--retry-max-delay", type=float, default=60.0)
@@ -505,8 +542,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-turns",
         type=int,
         default=40,
-        help="Teacher tool-call budget. Matches the RL max_model_turns; the earlier "
-             "value of 24 was the sole cause of every uncovered task in the v1 collection.",
+        help="Teacher model-turn budget, counted from turn_start events so it matches "
+             "the RL-side max_model_turns semantics (one unit per model request, not per "
+             "tool call). Falls back to counting tool calls if turn_start events are "
+             "unavailable. The earlier value of 24 was the sole cause of every uncovered "
+             "task in the v1 collection.",
+    )
+    parser.add_argument(
+        "--keep-act-results",
+        type=int,
+        default=None,
+        help="Number of trailing shop_act tool results kept in the model context "
+             "(context pruning). Must match the RL config's "
+             "context_keep_shop_act_results or SFT/RL context distributions diverge. "
+             "Defaults to the SHOP_CONTEXT_KEEP_ACT_RESULTS environment variable or 3.",
     )
     parser.add_argument("--min-reward", type=float, default=1e-12)
     parser.add_argument("--context-window", type=int, default=1_000_000)

@@ -11,14 +11,14 @@ MEGATRON_DIR="${MEGATRON_DIR:-${BASE_DIR}/Megatron-LM}"
 SLIME_PYTHON="${SLIME_PYTHON:-${MAMBA_ROOT_PREFIX}/envs/slime/bin/python}"
 SLIME_BIN="${SLIME_BIN:-$(dirname "${SLIME_PYTHON}")}"
 RAY_BIN="${RAY_BIN:-${SLIME_BIN}/ray}"
-source "${SLIME_DIR}/scripts/models/qwen3.5-2B.sh"
+source "${SLIME_DIR}/scripts/models/qwen3.5-0.8B.sh"
 
-HF_CHECKPOINT="${HF_CHECKPOINT:-${BASE_DIR}/models/Qwen3.5-2B}"
-REF_MODEL_PATH="${REF_MODEL_PATH:-${BASE_DIR}/models/Qwen3.5-2B_torch_dist}"
+HF_CHECKPOINT="${HF_CHECKPOINT:-${BASE_DIR}/models/Qwen3.5-0.8B}"
+REF_MODEL_PATH="${REF_MODEL_PATH:-${BASE_DIR}/models/Qwen3.5-0.8B_torch_dist}"
 PROMPT_DATA="${FULL_DATA:-${BASE_DIR}/slime-runs/shop_sft_512/prepared/turn_examples.jsonl}"
 NUM_GPUS="${NUM_GPUS:-1}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-12288}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-3}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4}"
 NUM_DATA_PASSES="${NUM_DATA_PASSES:-1}"
 
 for required in "${SLIME_PYTHON}" "${MEGATRON_DIR}" "${HF_CHECKPOINT}" "${REF_MODEL_PATH}" "${PROMPT_DATA}"; do
@@ -84,6 +84,7 @@ PERF_ARGS=(
   --recompute-num-layers 1
   --use-dynamic-batch-size
   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+  --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-512}"
 )
 
 OPTIMIZER_ARGS=(
@@ -160,7 +161,7 @@ trap cleanup EXIT INT TERM
   --temp-dir "${RAY_TEMP_DIR}"
 RAY_STARTED=1
 
-RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
+RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","NVTE_DEBUG","NVTE_DEBUG_LEVEL"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
 
 cd "${SLIME_DIR}"
 "${RAY_BIN}" job submit --address=http://127.0.0.1:8265 \

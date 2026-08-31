@@ -1,0 +1,15 @@
+eval:
+  defaults:
+    input_key: prompt
+    label_key: label
+    metadata_key: metadata
+    n_samples_per_eval_prompt: 1
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_response_len: 2048
+  datasets:
+    - name: shop_dev_full
+      path: examples/ShopSimulator/data/tasks_v2/dev.jsonl
+      custom_generate_function_path: examples.ShopSimulator.generate.generate
+      eval_task_timeout: 600
