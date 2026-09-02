@@ -1227,6 +1227,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to turn on passrate logging, which will log the pass@n of the responses in the rollout.",
             )
             parser.add_argument("--wandb-run-id", type=str, default=None)
+            parser.add_argument(
+                "--wandb-run-name",
+                type=str,
+                default=None,
+                help=(
+                    "Explicit W&B run display name. Only honoured when the random"
+                    " suffix is disabled (--disable-wandb-random-suffix); falls"
+                    " back to the group name."
+                ),
+            )
             return parser
 
         # tensorboard

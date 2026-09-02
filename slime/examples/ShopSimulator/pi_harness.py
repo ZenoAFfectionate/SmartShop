@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import signal
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class InfrastructureError(RuntimeError):
@@ -46,11 +49,18 @@ class PiRunResult:
 
 
 DEFAULT_EXTENSION = Path(__file__).with_name("shop_extension.ts")
+# Authoritative pi event types captured into rollout metadata for offline
+# trajectory analysis (zero-variance groups, behaviour process rewards, ...).
+# Shared by the SFT teacher collector and the RL rollout path.
+AUTHORITATIVE_EVENT_TYPES = {
+    "session", "agent_start", "agent_end", "turn_start", "turn_end",
+    "message_end", "tool_execution_start", "tool_execution_end",
+}
 # Error-classification prefixes. These MUST stay byte-identical to the
 # TypeScript side in shop_extension.ts (INFRASTRUCTURE_ERROR_PREFIX /
 # AGENT_ERROR_PREFIX): the extension tags tool errors with them and
 # _classify_tool_error() maps the prefix to retry-vs-reject semantics here.
-# Parity is enforced by tests/test_shopsimulator/test_f6_prefix_parity.py.
+# Parity is enforced by tests/test_shopsimulator/test_pi_harness.py.
 INFRASTRUCTURE_ERROR_PREFIX = "[shop_infrastructure]"
 AGENT_ERROR_PREFIX = "[shop_agent]"
 DEFAULT_SYSTEM_PROMPT = (
@@ -214,6 +224,35 @@ async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
         except ProcessLookupError:
             pass
         await proc.wait()
+
+
+async def _release_env_slot(env_url: str, rollout_session_id: str) -> None:
+    """Best-effort return of this session's env slot to the ShopSimulator pool.
+
+    Normal completions free their slot server-side (over=true) or via the pi
+    extension's session_shutdown hook. When pi dies abnormally (wall-clock
+    timeout SIGKILL, crash) neither runs and the slot would leak forever — the
+    2026-09-01 incident exhausted all 20 slots this way. The env's
+    release_session action is idempotent, so calling it unconditionally after
+    termination is safe: for already-freed slots it is a cheap no-op.
+    """
+    if not env_url:
+        return
+    try:
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                env_url,
+                json={"action": "release_session", "rollout_session_id": rollout_session_id},
+            ) as resp:
+                await resp.read()
+    except Exception:  # noqa: BLE001 — best effort by design
+        logger.debug(
+            "release_session for %s failed (env may be down or slot already free)",
+            rollout_session_id,
+        )
 
 
 async def run_pi(
@@ -393,6 +432,10 @@ async def run_pi(
             parsed.error, result=parsed
         ) from exc
     finally:
+        # Belt-and-braces slot return: covers every abnormal exit path
+        # (timeout SIGKILL above, pi crash, ...) where the extension's
+        # session_shutdown hook never runs and the slot would leak.
+        await _release_env_slot(env_url, session_id)
         if context_trace_path.exists():
             try:
                 parsed.context_traces = [

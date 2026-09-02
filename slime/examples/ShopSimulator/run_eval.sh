@@ -96,6 +96,30 @@ TRAIN_ARGS=(
   --colocate
 )
 
+# B1 评测留档（可选）：单 step job，wandb/tensorboard 仅作结果存档与曲线。
+# 命名规范同 run_rl.sh。
+if [[ "${USE_WANDB:-0}" == "1" ]]; then
+  TRAIN_ARGS+=(
+    --use-wandb
+    --wandb-mode "${WANDB_MODE:-offline}"
+    --wandb-dir "${WANDB_DIR:-${RUNS_ROOT}/wandb}"
+    --wandb-project "${WANDB_PROJECT:-smartshop}"
+    --wandb-group "eval"
+    --wandb-run-name "${RUN_ROOT##*/}"
+    --disable-wandb-random-suffix
+  )
+  [[ -n "${WANDB_KEY:-}" ]] && TRAIN_ARGS+=(--wandb-key "${WANDB_KEY}")
+  [[ -n "${WANDB_HOST:-}" ]] && TRAIN_ARGS+=(--wandb-host "${WANDB_HOST}")
+  [[ -n "${WANDB_TEAM:-}" ]] && TRAIN_ARGS+=(--wandb-team "${WANDB_TEAM}")
+fi
+if [[ "${USE_TENSORBOARD:-0}" == "1" ]]; then
+  TRAIN_ARGS+=(
+    --use-tensorboard
+    --tb-project-name "${TENSORBOARD_DIR:-${RUNS_ROOT}/tensorboard}"
+    --tb-experiment-name "eval"
+  )
+fi
+
 {
   printf '%q ' "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}"
   printf '\n'
@@ -159,7 +183,7 @@ trap cleanup EXIT INT TERM
   --temp-dir "${RAY_TEMP_DIR}"
 RAY_STARTED=1
 
-RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_VISIBLE_DEVICES","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","SHOP_ENV_URL","SHOP_MAX_TURNS","SHOP_CONTEXT_KEEP_ACT_RESULTS","SHOP_ROLLOUT_TIMEOUT_SEC","SHOP_SYSTEM_PROMPT","SHOP_SYSTEM_PROMPT_FILE","ADAPTER_PUBLIC_HOST","ADAPTER_BIND_HOST","ADAPTER_PORT","PI_BIN"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
+RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_VISIBLE_DEVICES","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","SHOP_ENV_URL","SHOP_MAX_TURNS","SHOP_CONTEXT_KEEP_ACT_RESULTS","SHOP_ROLLOUT_TIMEOUT_SEC","SHOP_SYSTEM_PROMPT","SHOP_SYSTEM_PROMPT_FILE","ADAPTER_PUBLIC_HOST","ADAPTER_BIND_HOST","ADAPTER_PORT","PI_BIN","WANDB_MODE","WANDB_API_KEY","WANDB_BASE_URL","TENSORBOARD_DIR"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
 
 # 等待 Ray job agent 就绪（ray start 后 agent 需要数秒启动，
 # 过早 submit 会报 "No available agent to submit job" 500 错误）
@@ -203,8 +227,11 @@ if (( SUBMIT_OK != 1 )); then
 fi
 echo "评测 job 已提交: ${JOB_ID}"
 
-# 跟踪 job 日志直至结束（--follow 阻塞到 job 完成）
-"${RAY_BIN}" job logs --address="${RAY_ADDRESS}" --follow "${JOB_ID}" 2>&1 | tee "${RUN_ROOT}/eval.log"
+# 跟踪 job 日志直至结束（--follow 阻塞到 job 完成）。
+# || true：ray CLI 在 job 正常结束后仍可能以非零码退出（WebSocket 关闭被
+# 判为异常），在 set -euo pipefail 下会误杀脚本、跳过下方 status 判定与
+# summarize（2026-09-02 DAPO 评测误报 code=1 的根因）。成败以 job status 为准。
+"${RAY_BIN}" job logs --address="${RAY_ADDRESS}" --follow "${JOB_ID}" 2>&1 | tee "${RUN_ROOT}/eval.log" || true
 
 # 以 job 最终状态判定成败（job 运行失败不重试，只有提交失败才重试）。
 # 注意：job status 输出含多行横幅，需匹配关键词而非盲取最后一行。
@@ -215,5 +242,5 @@ case "${STATUS}" in
   *) echo "错误: 评测 job 未成功 (status=${STATUS:-UNKNOWN})" >&2; exit 5 ;;
 esac
 
-"${SLIME_PYTHON}" -m examples.ShopSimulator.summarize_eval --run-root "${RUN_ROOT}"
+"${SLIME_PYTHON}" -m examples.ShopSimulator.utils summarize --run-root "${RUN_ROOT}"
 printf 'Evaluation complete. Results: %s\n' "${RUN_ROOT}/eval_results.json"

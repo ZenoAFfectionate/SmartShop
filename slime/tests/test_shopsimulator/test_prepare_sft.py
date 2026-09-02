@@ -1,13 +1,10 @@
-"""Tests for prepare_sft helpers and the SFT/RL consistency verifier (A3)."""
+"""Tests for prepare_sft helpers (message conversion + percentile)."""
 
 from __future__ import annotations
-
-import json
 
 import pytest
 
 from examples.ShopSimulator.prepare_sft import percentile, text_content, to_qwen_message
-from examples.ShopSimulator.verify_consistency import verify
 
 
 class TestPrepareSftHelpers:
@@ -66,44 +63,3 @@ class TestPrepareSftHelpers:
         assert percentile(values, 0.5) == 3.0
         assert percentile(values, 1.0) == 5.0
         assert percentile([], 0.5) == 0.0
-
-
-class TestVerifyConsistency:
-    @staticmethod
-    def write_rows(tmp_path, rows, name="turn_examples.jsonl"):
-        path = tmp_path / name
-        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-        return path
-
-    @staticmethod
-    def row(keep):
-        metadata = {"example_id": "e", "task_id": 1}
-        if keep is not None:
-            metadata["context_keep_act_results"] = keep
-        return {"messages": [], "metadata": metadata}
-
-    def test_consistent(self, tmp_path):
-        path = self.write_rows(tmp_path, [self.row(3), self.row(3)])
-        ok, message = verify(path, 3)
-        assert ok and "consistent" in message
-
-    def test_inconsistent(self, tmp_path):
-        path = self.write_rows(tmp_path, [self.row(3), self.row(5)])
-        ok, message = verify(path, 3)
-        assert not ok and "5" in message
-
-    def test_missing_field_reports_legacy_dataset(self, tmp_path):
-        path = self.write_rows(tmp_path, [self.row(None)])
-        ok, message = verify(path, 3)
-        assert not ok and "predates" in message
-
-    def test_empty_dataset(self, tmp_path):
-        path = self.write_rows(tmp_path, [])
-        ok, message = verify(path, 3)
-        assert not ok and "no rows" in message
-
-    def test_invalid_json_raises(self, tmp_path):
-        path = tmp_path / "turn_examples.jsonl"
-        path.write_text("{broken\n", encoding="utf-8")
-        with pytest.raises(ValueError, match="invalid JSON"):
-            verify(path, 3)

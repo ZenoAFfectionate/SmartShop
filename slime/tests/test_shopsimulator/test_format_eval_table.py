@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from examples.ShopSimulator.format_eval_table import (
+from examples.ShopSimulator.utils import (
     TABLE_COLUMNS,
     format_header,
     format_row,
@@ -107,7 +107,7 @@ class TestLoadMetrics:
 
 class TestCliEndToEnd:
     def test_main_renders_rows(self, tmp_path, capsys, monkeypatch):
-        from examples.ShopSimulator import format_eval_table
+        from examples.ShopSimulator import utils
         run_root = tmp_path / "run_rl"
         run_root.mkdir()
         (run_root / "eval_results.json").write_text(
@@ -115,9 +115,9 @@ class TestCliEndToEnd:
         )
         monkeypatch.setattr(
             "sys.argv",
-            ["format_eval_table.py", "--header", "--label", "RL", "--results", str(run_root)],
+            ["utils", "table", "--header", "--label", "RL", "--results", str(run_root)],
         )
-        code = format_eval_table.main()
+        code = utils.main()
         assert code == 0
         out = capsys.readouterr().out
         assert "| 模型 |" in out            # header printed

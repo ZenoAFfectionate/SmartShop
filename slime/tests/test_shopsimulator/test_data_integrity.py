@@ -134,3 +134,33 @@ class TestDev100Slice:
         dev_categories = {row["metadata"]["category"] for row in load_pool("dev.jsonl")}
         assert len(categories) >= 50  # broad category coverage (56 at creation)
         assert categories <= dev_categories
+
+
+class TestReadmeDocumentsMetrics:
+    """The reward formulas must be documented, not folklore."""
+
+    @staticmethod
+    def readme() -> str:
+        return (Path(__file__).resolve().parents[3] / "README.md").read_text(encoding="utf-8")
+
+    def test_loose_formula_present(self):
+        text = self.readme()
+        assert "r_loose" in text
+        assert "|U_att∩Y_att|" in text  # additive formula skeleton
+        assert "arXiv:2601.18225" in text
+
+    def test_hard_formula_present(self):
+        text = self.readme()
+        assert "r_type × r_att × r_option × r_price" in text
+
+    def test_subscore_table_present(self):
+        text = self.readme()
+        for name in ("r_type", "r_att", "r_option", "r_price"):
+            assert name in text
+
+    def test_environment_requirements_banner_present(self):
+        # Linux + NVIDIA GPU must be stated up front.
+        text = self.readme()
+        assert "环境要求" in text
+        assert "NVIDIA GPU" in text
+        assert "macOS" in text

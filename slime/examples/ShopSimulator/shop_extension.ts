@@ -23,7 +23,7 @@ const PRUNED_SHOP_ACT_RESULT = "[旧的 shop_act 工具结果已裁剪；done=fa
 // / AGENT_ERROR_PREFIX, used by _classify_tool_error): the harness decides
 // "retry vs reject" based on these prefixes. A silent drift on either side
 // misclassifies agent errors as infrastructure errors (or vice versa).
-// Parity is enforced by tests/test_shopsimulator/test_f6_prefix_parity.py.
+// Parity is enforced by tests/test_shopsimulator/test_pi_harness.py.
 const INFRASTRUCTURE_ERROR_PREFIX = "[shop_infrastructure]";
 const AGENT_ERROR_PREFIX = "[shop_agent]";
 

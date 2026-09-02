@@ -46,8 +46,11 @@ def init_wandb_primary(args):
         group = args.wandb_group + "_" + wandb.util.generate_id()
         run_name = f"{group}-RANK_{args.rank}"
     else:
+        # Deterministic naming convention: group = algorithm, run name may be
+        # set explicitly by the launcher (e.g. the RUN_ROOT directory name) so
+        # {project}/{group}/{run_name} maps 1:1 onto experiment layout.
         group = args.wandb_group
-        run_name = args.wandb_group
+        run_name = getattr(args, "wandb_run_name", None) or args.wandb_group
 
     # Prepare wandb init parameters
     init_kwargs = {

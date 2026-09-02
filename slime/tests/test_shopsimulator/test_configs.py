@@ -1,9 +1,14 @@
-"""Config-guard tests: pin the semantics of the four eval yaml files (D3/C2).
+"""Config-guard tests: pin the semantics of the primary eval yaml (D3/C2).
 
-These yamls encode deliberate experimental contrasts (sampling k=1 vs k=4,
-temperature 1.0 vs greedy 0.0, official test vs dev). A silent edit to the
-wrong key would invalidate published comparisons, so the contrasts themselves
-are pinned here.
+The published main table is produced with ``shop_eval_official_k1.yaml``
+(sampling k=1, temperature 1.0, top_p 1.0). A silent edit to the wrong key —
+e.g. flipping temperature to 0.0 or changing the dataset — would invalidate
+every published comparison, so the k1 semantics are pinned here.
+
+The contrast configs that used to be guarded here (k4 / greedy / dev100 for
+the X3/X7 ablations) were removed together with their experiments on
+2026-09-02: those experiments are not being run, so the guards had nothing
+to protect and only produced xfail noise.
 """
 
 from __future__ import annotations
@@ -47,43 +52,3 @@ class TestOfficialK1Baseline:
         assert dataset["name"] == "shop_official_test_200"
         assert dataset["path"].endswith("official_test_200.jsonl")
         assert dataset["custom_generate_function_path"] == "examples.ShopSimulator.generate.generate"
-
-
-class TestOfficialK4:
-    def test_only_k_differs_from_k1(self):
-        k1 = defaults_of("shop_eval_official_k1.yaml")
-        k4 = defaults_of("shop_eval_official_k4.yaml")
-        assert k4["n_samples_per_eval_prompt"] == 4
-        assert k4["temperature"] == k1["temperature"]
-        assert dataset_of("shop_eval_official_k4.yaml")["path"] == dataset_of("shop_eval_official_k1.yaml")["path"]
-
-
-class TestOfficialK1Greedy:
-    def test_only_temperature_differs_from_k1(self):
-        k1 = defaults_of("shop_eval_official_k1.yaml")
-        greedy = defaults_of("shop_eval_official_k1_greedy.yaml")
-        assert greedy["n_samples_per_eval_prompt"] == 1
-        assert greedy["temperature"] == 0.0
-        assert greedy["top_p"] == k1["top_p"]
-        assert dataset_of("shop_eval_official_k1_greedy.yaml")["path"] == dataset_of("shop_eval_official_k1.yaml")["path"]
-
-
-class TestDev100:
-    def test_dev_slice_points_at_dev100(self):
-        defaults = defaults_of("shop_dev100.yaml")
-        assert defaults["n_samples_per_eval_prompt"] == 1
-        assert defaults["temperature"] == 1.0
-        dataset = dataset_of("shop_dev100.yaml")
-        assert dataset["name"] == "shop_dev100"
-        assert dataset["path"].endswith("dev100.jsonl")
-
-    def test_referenced_datasets_exist(self):
-        slime_root = CONFIG_DIR.parents[2]  # .../slime (config -> ShopSimulator -> examples -> slime)
-        for name in (
-            "shop_eval_official_k1.yaml",
-            "shop_eval_official_k4.yaml",
-            "shop_eval_official_k1_greedy.yaml",
-            "shop_dev100.yaml",
-        ):
-            path = dataset_of(name)["path"]
-            assert (slime_root / path).is_file(), f"{name} references missing dataset {path}"

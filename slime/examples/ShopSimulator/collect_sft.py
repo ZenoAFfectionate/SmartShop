@@ -13,15 +13,16 @@ from collections import Counter, deque
 from pathlib import Path
 from typing import Any
 
-from .pi_harness import DEFAULT_SYSTEM_PROMPT, InfrastructureError, effective_system_prompt, run_pi
+from .pi_harness import (
+    AUTHORITATIVE_EVENT_TYPES,
+    DEFAULT_SYSTEM_PROMPT,
+    InfrastructureError,
+    effective_system_prompt,
+    run_pi,
+)
 
 SCHEMA_VERSION = 1
 DEFAULT_PROMPT = "完成给定的购物任务。先调用 shop_reset，然后只使用 shop_act 与环境交互。"
-
-AUTHORITATIVE_EVENT_TYPES = {
-    "session", "agent_start", "agent_end", "turn_start", "turn_end",
-    "message_end", "tool_execution_start", "tool_execution_end",
-}
 
 def read_index(path: Path) -> list[dict]:
     rows: list[dict] = []

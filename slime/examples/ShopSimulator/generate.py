@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import numbers
 import os
 import secrets
 from collections import defaultdict
@@ -19,9 +20,43 @@ from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
 from .common import prompt_text
-from .pi_harness import InfrastructureError, PiRunResult, run_pi
+from .pi_harness import AUTHORITATIVE_EVENT_TYPES, InfrastructureError, PiRunResult, run_pi
 
 logger = logging.getLogger(__name__)
+
+
+def _capture_rollout_events_enabled() -> bool:
+    """Whether to persist each trajectory's event stream and context traces.
+
+    They land in sample metadata (written to disk by --save-debug-rollout-data).
+    Enabled by default; set SHOP_CAPTURE_ROLLOUT_EVENTS=0 to keep dumps smaller.
+    """
+    return os.environ.get("SHOP_CAPTURE_ROLLOUT_EVENTS", "1") not in {
+        "0", "false", "False", "no", "off",
+    }
+
+
+CAPTURE_ROLLOUT_EVENTS = _capture_rollout_events_enabled()
+
+# R1-2 decomposed multi-dimension advantage. Motivation: r_option (~0.46) is
+# the weakest reward dimension, and scalar group normalization buries its
+# small variance inside the summed reward. When weight > 0, each dimension
+# (r_type/r_att/r_option/r_price) is mean-std normalized independently inside
+# the *scored* (env_done with reward_detail) candidate subset, then blended:
+#   advantage = (1 - w) * scalar_part + w * decomposed_part.
+# Candidates without sub-scores (not done) get decomposed_part = 0 and keep
+# only their scalar signal — the "scored vs unscored" layering the paper plan
+# requires. 0 = fully off (legacy behaviour). run_rl.sh enables it for CISPO.
+DECOMPOSED_ADVANTAGE_WEIGHT = float(os.environ.get("SHOP_DECOMPOSED_ADVANTAGE_WEIGHT", "0") or 0)
+
+# R3-2 behaviour process reward. +delta when the agent visited the goal
+# product's detail page (click[goal_asin]) before click[buy now]; -delta per
+# repeated action (2nd occurrence onward, e.g. deadlock-style search loops).
+# The bonus is added to the training advantage only; raw_rewards and eval
+# metrics stay pure environment rewards. 0 = fully off (legacy behaviour).
+BEHAVIOR_DELTA = float(os.environ.get("SHOP_BEHAVIOR_DELTA", "0") or 0)
+
+DECOMPOSED_DIMENSIONS = ("r_type", "r_att", "r_option", "r_price")
 
 
 def _candidate_fragments(candidate: Sample | list[Sample]) -> list[Sample]:
@@ -77,6 +112,100 @@ def validate_complete_groups(args, groups) -> None:
                 raise RuntimeError(f"ShopSimulator candidate {candidate_id} has no trainable action tokens")
 
 
+def _repeat_state_penalty(actions: list[str], delta: float) -> float:
+    """Penalty for re-visiting the same state, tuned to avoid false positives.
+
+    Two penalties, never double-counted per position:
+    - consecutive identical actions (stuck-in-place, any verb);
+    - reusing the same search query anywhere in the trajectory (a re-issued
+      search brings no new information — the deadlock signature).
+
+    Deliberately NOT penalized (legitimate exploration, not state repeats):
+    - re-clicking a product asin (comparing candidates back and forth);
+    - detail tabs (features/description/reviews) — same tab name on different
+      products is a different state;
+    - navigation (back / paging / spec selection).
+    """
+    penalty = 0.0
+    search_counts: dict[str, int] = {}
+    previous = None
+    for action in actions:
+        is_search_repeat = False
+        if action.startswith("search["):
+            search_counts[action] = search_counts.get(action, 0) + 1
+            is_search_repeat = search_counts[action] >= 2
+        if action == previous or is_search_repeat:
+            penalty += delta
+        previous = action
+    return penalty
+
+
+def _behavior_bonus(events: list[dict], goal_asin: str | None, delta: float) -> float:
+    """R3-2 behaviour process reward from the captured action stream.
+
+    +delta: the agent reached the goal product's detail page (click[goal_asin])
+    before its first click[buy now] — the "verify specs before buying" habit
+    that low r_hard/low r_loose mismatches are missing.
+    -delta: repeated state visits (see _repeat_state_penalty) — the signature
+    of deadlock-style search/click loops (turn_limit_rate reduction target).
+    Empty events (capture disabled) or no delta yields exactly 0.0.
+    """
+    if delta <= 0 or not events:
+        return 0.0
+    actions = [
+        (e.get("args") or e.get("arguments") or {}).get("action", "")
+        for e in events
+        if e.get("type") == "tool_execution_start" and e.get("toolName") == "shop_act"
+    ]
+    bonus = 0.0
+    buy_now_index = next((i for i, a in enumerate(actions) if a == "click[buy now]"), None)
+    if buy_now_index is not None and goal_asin:
+        if any(a == f"click[{goal_asin}]" for a in actions[:buy_now_index]):
+            bonus += delta
+    return bonus - _repeat_state_penalty(actions, delta)
+
+
+def _decomposed_group_advantages(
+    candidate_rewards: list[tuple[int, float, list[int]]],
+    samples: list[Sample],
+    use_std: bool,
+) -> list[float]:
+    """R1-2 per-dimension normalized advantages for the scored candidate subset.
+
+    A candidate is *scored* when its reward_detail carries all four sub-scores
+    (env_done). Each dimension is normalized independently across scored
+    candidates (z-score when use_std, else mean-centering), then averaged with
+    equal weights — so r_option's small variance produces real gradient signal
+    instead of being buried in the scalar sum. Unscored candidates and groups
+    with <2 scored candidates get 0.0 (the sum stays zero across the group).
+    """
+    n = len(candidate_rewards)
+    scored: list[tuple[int, list[float]]] = []
+    for position, (_, _, positions) in enumerate(candidate_rewards):
+        detail = (samples[positions[0]].metadata or {}).get("reward_detail") or {}
+        values = [detail.get(dim) for dim in DECOMPOSED_DIMENSIONS]
+        # numbers.Real also covers numpy scalars; bools (e.g. r_price) coerce
+        # to 0.0/1.0, which matches their indicator semantics.
+        if all(isinstance(v, numbers.Real) for v in values):
+            scored.append((position, [float(v) for v in values]))
+    if len(scored) < 2:
+        return [0.0] * n
+    count = len(scored)
+    n_dims = len(DECOMPOSED_DIMENSIONS)
+    means = [sum(values[d] for _, values in scored) / count for d in range(n_dims)]
+    result = [0.0] * n
+    for position, values in scored:
+        z_sum = 0.0
+        for d in range(n_dims):
+            centered = values[d] - means[d]
+            if use_std:
+                var = sum((v[d] - means[d]) ** 2 for _, v in scored) / max(count - 1, 1)
+                centered /= math.sqrt(var) + 1e-6
+            z_sum += centered
+        result[position] = z_sum / n_dims
+    return result
+
+
 def normalize_candidate_group_rewards(args, samples: list[Sample]):
     """Normalize complete candidate groups; filtered groups receive zero advantage."""
     expected = int(args.n_samples_per_prompt)
@@ -114,13 +243,35 @@ def normalize_candidate_group_rewards(args, samples: list[Sample]):
             if not all(math.isfinite(value) for value in values) or any(value != values[0] for value in values[1:]):
                 raise RuntimeError(f"inconsistent reward across candidate {candidate_id} fan-out fragments")
             candidate_rewards.append((candidate_id, values[0], positions))
-        if max(value for _, value, _ in candidate_rewards) != min(value for _, value, _ in candidate_rewards):
-            nonzero_variance_groups += 1
-        mean = sum(value for _, value, _ in candidate_rewards) / expected
-        centered = [value - mean for _, value, _ in candidate_rewards]
+        # R3-2: the behaviour bonus was computed in finish_candidate_session
+        # and joins the candidate value *before* normalization; raw_rewards
+        # (and thus eval metrics) stay untouched. Variance is judged on the
+        # training signal (env reward + bonus), not on raw rewards alone.
+        train_values = [
+            value + float((samples[positions[0]].metadata or {}).get("behavior_bonus") or 0.0)
+            for _, value, positions in candidate_rewards
+        ]
+        has_scalar_variance = max(train_values) != min(train_values)
+        mean = sum(train_values) / expected
+        centered = [value - mean for value in train_values]
         if use_std:
             std = math.sqrt(sum(value * value for value in centered) / max(expected - 1, 1))
             centered = [value / (std + 1e-6) for value in centered]
+        # R1-2: blend scalar and per-dimension decomposed advantages. A group
+        # whose scalar rewards are identical but whose sub-scores differ still
+        # carries gradient signal, so it counts as a variance group too.
+        if DECOMPOSED_ADVANTAGE_WEIGHT > 0:
+            decomposed = _decomposed_group_advantages(candidate_rewards, samples, use_std)
+            weight = DECOMPOSED_ADVANTAGE_WEIGHT
+            centered = [
+                (1.0 - weight) * scalar + weight * decomp
+                for scalar, decomp in zip(centered, decomposed, strict=True)
+            ]
+            has_variance = has_scalar_variance or any(abs(d) > 1e-12 for d in decomposed)
+        else:
+            has_variance = has_scalar_variance
+        if has_variance:
+            nonzero_variance_groups += 1
         for (_, _, positions), advantage in zip(candidate_rewards, centered, strict=True):
             for position in positions:
                 normalized[position] = advantage
@@ -298,6 +449,16 @@ async def finish_candidate_session(
             "max_model_turns": state.max_model_turns,
             "termination_reason": termination_reason,
             "truncated": turn_limited,
+            # R3-2: computed here (audit trail in dumps) but only *applied* to
+            # the training advantage in normalize_candidate_group_rewards, so
+            # eval metrics stay pure environment rewards.
+            "behavior_bonus": _behavior_bonus(
+                result.events if CAPTURE_ROLLOUT_EVENTS else [],
+                result.goal_asin,
+                BEHAVIOR_DELTA,
+            ),
+            "events": result.events if CAPTURE_ROLLOUT_EVENTS else [],
+            "context_traces": result.context_traces if CAPTURE_ROLLOUT_EVENTS else [],
         },
     )
     if turn_limited:
@@ -348,6 +509,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             timeout_sec=timeout_sec,
             context_window=state.max_context_len,
             max_tokens=state.max_response_len,
+            capture_events=CAPTURE_ROLLOUT_EVENTS,
+            capture_event_types=AUTHORITATIVE_EVENT_TYPES if CAPTURE_ROLLOUT_EVENTS else None,
         )
         samples = await finish_candidate_session(
             state,

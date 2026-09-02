@@ -1,15 +1,26 @@
-"""Tests for examples.ShopSimulator.collect_sft (candidate gate & traces)."""
+"""Tests for examples.ShopSimulator.collect_sft (candidate gate, traces, I/O & CLI)."""
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 
 import pytest
 
 from examples.ShopSimulator.collect_sft import (
+    _event_call_id,
+    _event_tool_name,
+    _retryable,
+    async_main,
+    atomic_write_json,
+    atomic_write_jsonl,
+    authoritative_messages,
+    build_parser,
     context_snapshots,
     context_trace_matches,
     evaluate_candidate,
+    export_results,
     normalize_context_traces,
     read_index,
 )
@@ -244,3 +255,204 @@ class TestReadIndex:
         path.write_text("{not json}\n", encoding="utf-8")
         with pytest.raises(ValueError, match="invalid JSON"):
             read_index(path)
+
+
+class TestEventHelpers:
+    def test_tool_name_variants(self):
+        assert _event_tool_name({"toolName": "a"}) == "a"
+        assert _event_tool_name({"tool_name": "b"}) == "b"
+        assert _event_tool_name({}) is None
+
+    def test_call_id_variants(self):
+        assert _event_call_id({"toolCallId": 1}) == "1"
+        assert _event_call_id({"tool_call_id": "x"}) == "x"
+        assert _event_call_id({"id": "y"}) == "y"
+        assert _event_call_id({}) is None
+
+
+class TestAuthoritativeMessages:
+    def test_only_message_end_events(self):
+        events = [
+            {"type": "turn_start"},
+            {"type": "message_end", "message": {"role": "user", "content": "hi"}},
+            {"type": "tool_execution_end"},
+        ]
+        assert authoritative_messages(events) == [{"role": "user", "content": "hi"}]
+
+    def test_skips_message_without_role(self):
+        events = [{"type": "message_end", "message": {"content": "no role"}}]
+        assert authoritative_messages(events) == []
+
+    def test_strips_assistant_thinking_parts(self):
+        events = [{
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "text": "hmm"},
+                    {"type": "text", "text": "act"},
+                    {"type": "toolCall", "id": "t1", "name": "shop_act", "arguments": {}},
+                ],
+            },
+        }]
+        messages = authoritative_messages(events)
+        content = messages[0]["content"]
+        assert [part.get("type") for part in content] == ["text", "toolCall"]
+
+    def test_does_not_mutate_input(self):
+        event = {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "thinking", "text": "x"}]}}
+        authoritative_messages([event])
+        assert event["message"]["content"][0]["type"] == "thinking"
+
+
+class TestAtomicWrites:
+    def test_atomic_write_json(self, tmp_path):
+        path = tmp_path / "sub" / "out.json"
+        atomic_write_json(path, {"b": 1, "a": 2})
+        assert json.loads(path.read_text()) == {"a": 2, "b": 1}
+
+    def test_atomic_write_jsonl(self, tmp_path):
+        path = tmp_path / "out.jsonl"
+        atomic_write_jsonl(path, [{"b": 1}, {"a": 2}])
+        lines = path.read_text().strip().splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[0]) == {"b": 1}
+        assert json.loads(lines[1]) == {"a": 2}
+
+    def test_atomic_write_overwrites(self, tmp_path):
+        path = tmp_path / "out.json"
+        atomic_write_json(path, {"v": 1})
+        atomic_write_json(path, {"v": 2})
+        assert json.loads(path.read_text()) == {"v": 2}
+
+
+class TestRetryable:
+    def test_retryable_markers(self):
+        for text in [
+            "429",
+            "rate limit",
+            "too many requests",
+            "connection reset",
+            "timed out",
+            "timeout",
+            "502",
+            "503",
+            "504",
+            "temporarily unavailable",
+        ]:
+            assert _retryable(text), text
+
+    def test_non_retryable(self):
+        assert not _retryable("invalid api key")
+        assert not _retryable("deterministic failure")
+
+
+class TestExportResults:
+    def _candidate(self, task_id, sample_id, accepted, reward=1.0, tool_calls=5, done=True):
+        return {
+            "trajectory_id": f"sft-{task_id:06d}-{sample_id:03d}",
+            "task_id": task_id,
+            "sample_id": sample_id,
+            "split": "sft",
+            "accepted": accepted,
+            "reward": reward,
+            "done": done,
+            "error": None,
+            "tool_calls": tool_calls,
+            "messages": [{"role": "system", "content": "s"}],
+            "rejection_reasons": [] if accepted else ["not_done"],
+            "attempts": [],
+        }
+
+    def test_export_writes_accepted_and_summary(self, tmp_path):
+        args = argparse.Namespace(model="deepseek-v4-flash", max_turns=40)
+        candidates = [
+            self._candidate(1, 0, True),
+            self._candidate(1, 1, False, done=False),
+            self._candidate(2, 0, True),
+        ]
+        summary = export_results(tmp_path, candidates, args)
+        assert summary["candidates"] == 3
+        assert summary["accepted"] == 2
+        assert summary["tasks_attempted"] == 2
+        assert summary["tasks_covered"] == 2
+        assert summary["task_coverage"] == 1.0
+        assert summary["uncovered_tasks"] == 0
+        accepted_lines = (tmp_path / "accepted.jsonl").read_text().strip().splitlines()
+        assert len(accepted_lines) == 2
+        assert json.loads(accepted_lines[0])["metadata"]["task_id"] == 1
+        assert (tmp_path / "summary.json").is_file()
+
+    def test_export_uncovered_tasks(self, tmp_path):
+        args = argparse.Namespace(model="deepseek-v4-flash", max_turns=40)
+        candidates = [
+            self._candidate(1, 0, False, done=False, tool_calls=40),
+            self._candidate(2, 0, True),
+        ]
+        summary = export_results(tmp_path, candidates, args)
+        assert summary["tasks_covered"] == 1
+        assert summary["uncovered_tasks"] == 1
+        uncovered_lines = (tmp_path / "uncovered_tasks.jsonl").read_text().strip().splitlines()
+        assert len(uncovered_lines) == 1
+        assert json.loads(uncovered_lines[0])["task_id"] == 1
+
+
+class TestParserDefaults:
+    def test_api_key_file_has_no_default(self):
+        # The old /root/api.txt default silently picked up stale keys.
+        args = build_parser().parse_args(["--output-dir", "/tmp/x"])
+        assert args.api_key_file is None
+
+    def test_launches_per_minute_defaults_to_30(self):
+        # A conservative default instead of unlimited (0 still disables).
+        args = build_parser().parse_args(["--output-dir", "/tmp/x"])
+        assert args.launches_per_minute == 30
+
+    def test_teacher_provider_defaults_to_deepseek(self):
+        args = build_parser().parse_args(["--output-dir", "/tmp/x"])
+        assert args.teacher_provider == "deepseek"
+
+    def test_keep_act_results_defaults_to_none(self):
+        args = build_parser().parse_args(["--output-dir", "/tmp/x"])
+        assert args.keep_act_results is None
+
+
+def write_tasks(tmp_path) -> object:
+    tasks = tmp_path / "tasks.jsonl"
+    tasks.write_text(
+        json.dumps({"metadata": {"task_id": 1, "split": "sft"},
+                    "prompt": [{"role": "user", "content": "go"}]}) + "\n",
+        encoding="utf-8",
+    )
+    return tasks
+
+
+def make_args(tmp_path, **overrides):
+    argv = [
+        "--output-dir", str(tmp_path / "out"),
+        "--tasks", str(write_tasks(tmp_path)),
+    ]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+class TestApiKeyRequired:
+    def test_missing_api_key_aborts_unless_dry_run(self, tmp_path):
+        args = make_args(tmp_path)  # api_key_file=None, dry_run=False
+        with pytest.raises(SystemExit, match="--api-key-file is required"):
+            asyncio.run(async_main(args))
+
+    def test_dry_run_never_needs_api_key(self, tmp_path):
+        args = make_args(tmp_path, dry_run=True)
+        summary = asyncio.run(async_main(args))
+        assert summary["selected_tasks"] == 1
+
+    def test_empty_key_file_rejected(self, tmp_path):
+        key_file = tmp_path / "key.txt"
+        key_file.write_text("\n", encoding="utf-8")
+        args = make_args(tmp_path, api_key_file=key_file)
+        with pytest.raises(SystemExit, match="first line is empty"):
+            asyncio.run(async_main(args))
