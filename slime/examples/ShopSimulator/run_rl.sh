@@ -31,6 +31,20 @@
 #   # 终端 A（GPU0）:
 #   CUDA_VISIBLE_DEVICES=0 ALGORITHM=grpo bash run_rl.sh
 #   # 终端 B（GPU1）: 三类端口必须错开（temp-dir 已按算法自动独立）
+# 多卡并行（每卡一个独立 ray 集群 + 一个独立 env 实例）：
+#   # 0) 启动/补齐 env 实例池（每实例 20 槽位 = 一个实验的并发 candidate 数）
+#   bash ShopSimulator/start_server.sh 3
+#   # 1) 启动前预检（只读：不启动服务、不创建 RUN_ROOT）
+#   PREFLIGHT=1 CUDA_VISIBLE_DEVICES=1 ALGORITHM=cispo RUN_TAG=_mem2 \
+#     RAY_GCS_PORT=6380 RAY_DASHBOARD_PORT=8266 RAY_DASHBOARD_AGENT_PORT=52366 \
+#     RAY_MIN_WORKER_PORT=20000 RAY_MAX_WORKER_PORT=29999 \
+#     RAY_METRICS_EXPORT_PORT=44218 ADAPTER_PORT=18082 \
+#     SHOP_ENV_URL=http://127.0.0.1:5001/api/shop_agent \
+#     RAY_TEMP_DIR=/hdd/kemove/ray/e1 bash run_rl.sh
+#   # 2) 预检通过后去掉 PREFLIGHT=1 正式启动
+#   端口错开配方（实验序号 i）：gcs 6379+i / dashboard 8265+i / agent 52365+i /
+#     worker (i+1)0000-((i+2)0000-1) / metrics 44217+i / adapter 18081+i /
+#     env 5000+i / RAY_TEMP_DIR ${BASE_DIR}/ray/e<i>
 #   CUDA_VISIBLE_DEVICES=1 ALGORITHM=cispo RAY_GCS_PORT=6380 \
 #     RAY_DASHBOARD_PORT=8266 ADAPTER_PORT=18081 bash run_rl.sh
 # 原理与约束:
@@ -191,6 +205,15 @@ WANDB_TEAM="${WANDB_TEAM:-}"
 # 保留用户显式传入的 RUN_ROOT（仅单算法模式；all 模式按算法自动命名并忽略之）
 USER_RUN_ROOT="${RUN_ROOT:-}"
 
+# RUN_TAG：同一算法多组对照实验的目录后缀（如 _r12r32 表示启用 R1-2 分解
+# 优势 + R3-2 行为分的重训组）。同时作用于训练 RUN_ROOT、评测 RUN_ROOT、
+# 评测日志与 Ray temp-dir，避免覆盖无后缀的历史结果。
+RUN_TAG="${RUN_TAG:-}"
+if [[ -n "${RUN_TAG}" ]] && [[ ! "${RUN_TAG}" =~ ^_[A-Za-z0-9_-]+$ ]]; then
+  echo "RUN_TAG 必须匹配 _[A-Za-z0-9_-]+（如 _r12r32），当前: ${RUN_TAG}" >&2
+  exit 2
+fi
+
 # ── 算法 → advantage estimator 映射 ──────────────────────────────
 estimator_for() {
   case "$1" in
@@ -206,7 +229,7 @@ say() { echo "[rl $(date '+%m-%d %H:%M:%S')] $*"; }
 # ── 并行安全的 Ray 集群清理 ──────────────────────────────────────
 # 只杀"本集群"的 daemon（gcs_server 按 GCS 端口匹配、其余组件按 temp-dir 匹配）。
 # 绝不使用全局 ray stop --force —— 它会误杀机器上其他实验的 Ray 集群
-# （2026-09-01 血泪教训：一次 CHECK_ONLY 测试曾把正在训练的 DAPO 集群杀掉）。
+# （CHECK_ONLY 触发清理时会误杀同名端口上正在运行的训练集群）。
 # Ray worker（ray:: 进程）不含上述标识，但由 raylet 托管，raylet 退出后自行终止。
 stop_own_ray() {
   pkill -TERM -f -- "gcs_server_port=${RAY_GCS_PORT}" 2>/dev/null || true
@@ -217,10 +240,21 @@ stop_own_ray() {
   if [[ -n "${RAY_TEMP_DIR:-}" ]]; then
     rm -rf "${RAY_TEMP_DIR}"/session_* 2>/dev/null || true
   fi
+  # 等待 GCS 进程真正退出：KILL 后端口释放是异步的，不等待会让 chain 里
+  # 下一个算法 ray start 时撞 "GCS 端口被占"。
+  local _wait=0
+  while pgrep -f -- "gcs_server_port=${RAY_GCS_PORT}" >/dev/null 2>&1; do
+    if (( _wait >= 30 )); then
+      echo "警告: GCS 端口 ${RAY_GCS_PORT} 的进程 30s 内未退出，后续 ray start 可能失败" >&2
+      return 0
+    fi
+    sleep 2
+    _wait=$(( _wait + 2 ))
+  done
 }
 
 # ── ShopSimulator env 预检与守护 ─────────────────────────────────
-# 2026-09-01 事故复盘：异常终止的 pi 会话（超时 SIGKILL / 崩溃）不会归还
+# 异常终止的 pi 会话（超时 SIGKILL / 崩溃）不会归还
 # env 槽位，20 个槽位被泄漏耗尽后所有 reset 失败 → reward 全零 → 训练
 # 空转 18 小时。以下预检 + watchdog 与 env 侧新增的 release_session /
 # release_stale API（pack_api.py）共同构成防线：
@@ -296,16 +330,105 @@ ensure_env_ready() {
 }
 
 check_gpu_free() {
+  # 物理设备 = CUDA_VISIBLE_DEVICES 的首个值（与 run_sft.sh / run_eval.sh 同语义）。
+  # 旧写法用 GPU_INDEX（默认 0）会永远查 GPU 0 → 三卡并行时第二、三张卡被误报
+  # "已被占用"（2026-09-22 三卡并行实测）。
+  local _phys="${CUDA_VISIBLE_DEVICES:-0}"
+  _phys="${_phys%%,*}"
   local used
-  used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${GPU_INDEX}" 2>/dev/null | tr -d ' ')"
+  used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${_phys}" 2>/dev/null | tr -d ' ')"
   if ! [[ "${used}" =~ ^[0-9]+$ ]]; then
-    echo "错误: 无法读取 GPU ${GPU_INDEX} 状态（nvidia-smi）" >&2
+    echo "错误: 无法读取 GPU ${_phys} 状态（nvidia-smi）" >&2
     return 1
   fi
   if (( used > 2000 )); then
-    echo "错误: GPU ${GPU_INDEX} 已被占用（${used} MiB）；如有正在运行的训练请先停止" >&2
+    echo "错误: GPU ${_phys} 已被占用（${used} MiB）；如有正在运行的训练请先停止" >&2
     return 1
   fi
+}
+
+# ── 并行前置检查（PREFLIGHT=1 调用；只读）────────────────────────────
+preflight_one() {
+  local algo="${1:-?}" problems=0
+  local gpu="${CUDA_VISIBLE_DEVICES:-0}"
+  gpu="${gpu%%,*}"
+  echo "── PREFLIGHT（${algo}）──"
+  # 1) GPU（按可见设备，与 check_gpu_free 同语义）
+  local used
+  used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${gpu}" 2>/dev/null | tr -d ' ')"
+  if [[ "${used}" =~ ^[0-9]+$ ]] && (( used <= 2000 )); then
+    echo "  ✓ GPU ${gpu} 空闲"
+  else
+    echo "  ✗ GPU ${gpu} 已占用 ${used:-读取失败} MiB"
+    problems=$(( problems + 1 ))
+  fi
+  # 2) 本实例端口（agent 端口是并行时最容易撞的一个）
+  local pair kind port holder
+  for pair in "GCS:${RAY_GCS_PORT}" "dashboard:${RAY_DASHBOARD_PORT}" \
+              "agent:${RAY_DASHBOARD_AGENT_PORT:-52365}" \
+              "metrics:${RAY_METRICS_EXPORT_PORT:-44217}" \
+              "adapter:${ADAPTER_PORT}"; do
+    kind="${pair%%:*}"
+    port="${pair#*:}"
+    holder="$(ss -tlnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -oE 'users:\(\("[^"]+' | head -1 | sed 's/users:((\"//')"
+    if [[ -n "${holder}" ]]; then
+      echo "  ✗ ${kind} 端口 ${port} 被占（${holder}）→ 与其他实验错开"
+      problems=$(( problems + 1 ))
+    else
+      echo "  ✓ ${kind} 端口 ${port} 空闲"
+    fi
+  done
+  # worker 段抽查
+  local wmin="${RAY_MIN_WORKER_PORT:-10000}" wmax="${RAY_MAX_WORKER_PORT:-19999}" wbusy=0
+  for port in $(seq "${wmin}" "$(( wmin + 15 ))"); do
+    if ss -tln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then wbusy=$(( wbusy + 1 )); fi
+  done
+  if (( wbusy > 0 )); then
+    echo "  ✗ worker 段 ${wmin}-${wmax} 有 ${wbusy} 个端口被占 → 换段"
+    problems=$(( problems + 1 ))
+  else
+    echo "  ✓ worker 段 ${wmin}-${wmax} 空闲"
+  fi
+  # 3) env 实例容量
+  local body cap
+  body="$(curl -s -m 4 "${SHOP_ENV_URL}" -X POST -H 'Content-Type: application/json' \
+    -d '{"action":"status"}' 2>/dev/null)"
+  cap="$(printf '%s' "${body}" | "${SLIME_PYTHON}" -c 'import json,sys
+try:
+    d = json.load(sys.stdin)["result"]
+    print(d["capacity"], d["free"])
+except Exception:
+    print("", "")' 2>/dev/null)"
+  set -- ${cap}
+  if [[ -z "${1:-}" ]]; then
+    echo "  ✗ env ${SHOP_ENV_URL} 无响应；多实例可用：bash ShopSimulator/start_server.sh 3"
+    problems=$(( problems + 1 ))
+  else
+    echo "  ✓ env ${SHOP_ENV_URL} capacity=${1} free=${2}"
+  fi
+  # 4) RUN_ROOT 残留
+  if [[ -e "${RUN_ROOT}" ]]; then
+    echo "  ✗ RUN_ROOT 已存在（换 RUN_TAG 或删旧目录）：${RUN_ROOT}"
+    problems=$(( problems + 1 ))
+  else
+    echo "  ✓ RUN_ROOT 可用：${RUN_ROOT}"
+  fi
+  # 5) ray temp-dir 残留进程
+  local cnt
+  cnt="$(pgrep -cf "temp_dir=${RAY_TEMP_DIR}([[:space:]]|$)" 2>/dev/null || true)"
+  cnt="${cnt:-0}"
+  if [[ "${cnt}" =~ ^[0-9]+$ ]] && (( cnt > 0 )); then
+    echo "  ✗ temp-dir ${RAY_TEMP_DIR} 仍有 ${cnt} 个 ray 进程 → pkill -f 'temp_dir=${RAY_TEMP_DIR}'"
+    problems=$(( problems + 1 ))
+  else
+    echo "  ✓ temp-dir ${RAY_TEMP_DIR} 无残留进程"
+  fi
+  if (( problems == 0 )); then
+    echo "── PREFLIGHT 通过（0 问题）──"
+    return 0
+  fi
+  echo "── PREFLIGHT 发现 ${problems} 个问题，请先处理 ──"
+  return 2
 }
 
 start_env_watchdog() {
@@ -335,10 +458,22 @@ train_one() {
   local ALGO="$1"
   local ESTIMATOR
   ESTIMATOR="$(estimator_for "${ALGO}")"
-  # 单算法模式尊重用户显式 RUN_ROOT；all 模式按算法自动命名
-  local RUN_ROOT="${USER_RUN_ROOT:-${RUNS_ROOT}/qwen35_2b_shop_rl_${ALGO}}"
-  # Ray 会话目录按算法独立，是并行清理精确匹配的依据之一
-  local RAY_TEMP_DIR="${RAY_TEMP_DIR:-${BASE_DIR}/ray/rl_${ALGO}}"
+  # 单算法模式尊重用户显式 RUN_ROOT；all 模式按算法自动命名。
+  # RUN_TAG（如 _r12r32）用于同一算法的多组对照实验，避免覆盖历史 run/eval。
+  local RUN_ROOT="${USER_RUN_ROOT:-${RUNS_ROOT}/qwen35_2b_shop_rl_${ALGO}${RUN_TAG}}"
+  # Ray 会话目录按算法独立，是并行清理精确匹配的依据之一。
+  # e_ 前缀：temp_dir 会拼进 AF_UNIX socket 路径（≤107 字符硬限制），
+  # 长算法名 + 长 BASE_DIR 会撑爆它（详见 run_eval.sh 内同名校验）。
+  local RAY_TEMP_DIR="${RAY_TEMP_DIR:-${BASE_DIR}/ray/e_${ALGO}}"
+
+  # ── PREFLIGHT=1：并行编排前置检查（只读；不启动服务、不创建 RUN_ROOT）──
+  # 检查 GPU 语义 / 端口段冲突（尤其 dashboard agent 随机撞端口）/ env 实例容量
+  # / RUN_ROOT 残留 / ray temp-dir 残留。必须放在 Refusing 与 mkdir 之前，
+  # 否则 RUN_ROOT 残留时预检看不到它，且预检本身会把目录创建出来。
+  if [[ "${PREFLIGHT:-0}" == "1" ]]; then
+    preflight_one "${ALGO}"
+    return $?
+  fi
 
   if [[ -e "${RUN_ROOT}" ]] && [[ "${RESUME:-0}" != "1" ]]; then
     echo "Refusing to overwrite existing RUN_ROOT: ${RUN_ROOT} (set RESUME=1 to resume from its checkpoints)" >&2
@@ -407,14 +542,18 @@ train_one() {
     --recompute-method uniform
     --recompute-num-layers 1
     --use-dynamic-batch-size
-    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-12288}"
+    # 动态 batch 每 microbatch 的 token 上限。actor 训练同样要算全词表 logits
+    # （与 SFT 同一条 loss 路径），峰值显存 ≈ max_tokens × vocab(151936) × 2B：
+    # 16384→5GB、32768→10GB——SFT 侧已实测 32768 必 OOM，故默认取 chain 实测
+    # 安全的 16384；仍可用 MAX_TOKENS_PER_GPU 覆盖。单条超长样本会独立成批
+    # 不受此上限截断。
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-16384}"
     --rollout-num-gpus 1
     --rollout-num-gpus-per-engine 1
     --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
     --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.55}"
     --sglang-tool-call-parser qwen3_coder
     --sglang-reasoning-parser qwen3
-    --sglang-enable-deterministic-inference
     --seed "${SEED}"
     --attention-dropout 0.0
     --hidden-dropout 0.0
@@ -424,6 +563,16 @@ train_one() {
     --loss-mask-type qwen3_5
     --colocate
   )
+
+  # SGLang deterministic inference（默认开，保证同输入同输出、评测可复现）。
+  # 注意：该模式下 radix cache（跨请求前缀缓存）仅在 fa3/triton/ascend
+  # attention backend 受支持，其余 backend 会被 SGLang 静默禁用——表现为
+  # rollout 指标 prefix_cache_hit_rate 恒为 0。RL 训练 rollout 用 temp=1.0
+  # 采样，deterministic 的收益有限；若要启用 radix cache 加速 rollout，
+  # 设 SGLANG_DETERMINISTIC_INFERENCE=0（训练与评测可分别取舍）。
+  if [[ "${SGLANG_DETERMINISTIC_INFERENCE:-1}" == "1" ]]; then
+    TRAIN_ARGS+=(--sglang-enable-deterministic-inference)
+  fi
 
   # ── 恢复语义 ──────────────────────────────────────────────────
   # 默认不传 --start-rollout-id：slime 会自动从 --load 的 checkpoint 恢复
@@ -511,6 +660,14 @@ train_one() {
   fi
 
   # ── 启动前环境预检：env 服务/槽位/GPU，异常先修复、修不好则拒绝训练 ──
+  # AF_UNIX socket 路径 ≤107 字符：temp_dir + session_<42 字符> + /sockets/
+  # dash_MetricsHead 必须放得下，temp_dir 过长会让 dashboard 起不来、agent
+  # 永远不就绪。放在 CHECK_ONLY
+  # 之后：dry-run 只验证参数生成，不应被本地临时路径长度绑架。
+  if [[ ${#RAY_TEMP_DIR} -gt 40 ]]; then
+    echo "错误: RAY_TEMP_DIR 长度 ${#RAY_TEMP_DIR} > 40 字符，会导致 dashboard 无法启动：${RAY_TEMP_DIR}" >&2
+    return 2
+  fi
   ensure_env_ready || return 2
   check_gpu_free || return 2
 
@@ -528,22 +685,75 @@ train_one() {
   }
   trap cleanup EXIT INT TERM
 
+  # 多集群并行时还需隔离三类内部端口，否则 dashboard agent 会随机撞上已占端口，
+  # 以 "address already in use" 静默失败 → job submit 500 / No available agent
+  # （2026-09-22 三卡并行实测，错误只出现在 ray dashboard 内部日志里）。默认值
+  # 保持单实例行为不变。
   if ! "${RAY_BIN}" start --head --node-ip-address "${MASTER_ADDR}" --num-gpus 1 \
     --port "${RAY_GCS_PORT}" \
     --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port="${RAY_DASHBOARD_PORT}" \
+    --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_PORT:-52365}" \
+    --min-worker-port "${RAY_MIN_WORKER_PORT:-10000}" \
+    --max-worker-port "${RAY_MAX_WORKER_PORT:-19999}" \
+    --metrics-export-port "${RAY_METRICS_EXPORT_PORT:-44217}" \
     --temp-dir "${RAY_TEMP_DIR}"; then
-    echo "错误: ray start 失败（常见原因：GCS 端口 ${RAY_GCS_PORT} 被其他实验占用，或 temp-dir ${RAY_TEMP_DIR} 有残留；并行时按头部配方错开端口）" >&2
+    echo "错误: ray start 失败（常见原因：GCS/dashboard/agent/worker 端口被其他实验占用，或 temp-dir ${RAY_TEMP_DIR} 有残留；并行时需错开全部端口段）" >&2
     return 2
   fi
   RAY_STARTED=1
   start_env_watchdog
 
-  RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_VISIBLE_DEVICES","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","SHOP_ENV_URL","SHOP_MAX_TURNS","SHOP_CONTEXT_KEEP_ACT_RESULTS","SHOP_ROLLOUT_TIMEOUT_SEC","SHOP_REQUIRE_NONZERO_VARIANCE_PER_ROLLOUT","SHOP_CAPTURE_ROLLOUT_EVENTS","SHOP_DECOMPOSED_ADVANTAGE_WEIGHT","SHOP_BEHAVIOR_DELTA","WANDB_MODE","WANDB_API_KEY","WANDB_BASE_URL","TENSORBOARD_DIR","ADAPTER_PUBLIC_HOST","ADAPTER_BIND_HOST","ADAPTER_PORT","PI_BIN"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
+  # 等待 dashboard/agent 就绪：ray start 返回只代表 head 进程已拉起，
+  # dashboard agent 注册完成前 job submit 会 500（No available agent）。
+  local _deadline=$(( SECONDS + 120 ))
+  until curl -sf -m 3 "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/version" >/dev/null 2>&1; do
+    if (( SECONDS >= _deadline )); then
+      echo "错误: Ray dashboard 在 120s 内未就绪，放弃提交 ${ALGO}" >&2
+      return 2
+    fi
+    sleep 3
+  done
+
+  RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_VISIBLE_DEVICES","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","SHOP_ENV_URL","SHOP_MAX_TURNS","SHOP_CONTEXT_KEEP_ACT_RESULTS","SHOP_CONTEXT_STRUCTURED_MEMORY","SHOP_ROLLOUT_TIMEOUT_SEC","SHOP_REQUIRE_NONZERO_VARIANCE_PER_ROLLOUT","SHOP_CAPTURE_ROLLOUT_EVENTS","SHOP_DECOMPOSED_ADVANTAGE_WEIGHT","SHOP_BEHAVIOR_DELTA","SHOP_REWARD_METRIC","WANDB_MODE","WANDB_API_KEY","WANDB_BASE_URL","TENSORBOARD_DIR","ADAPTER_PUBLIC_HOST","ADAPTER_BIND_HOST","ADAPTER_PORT","PI_BIN"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
 
   cd "${SLIME_DIR}"
-  "${RAY_BIN}" job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
-    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}" 2>&1 | tee "${RUN_ROOT}/train.log"
+  # 提交失败（如 agent 未就绪的 500）必须传播出去：tee 会吞掉管道退出码，
+  # 之前链式脚本据此把失败当成功继续跑后续算法。仅对"提交阶段"错误
+  # （500 / No available agent）重试；job 已开始运行后的失败不重试（避免重跑）。
+  local _submit_ok=0 _attempt _rc
+  # 多实例并行时 dashboard agent 注册明显更慢（实测 3×20s 窗口不够），
+  # 放宽到 20 次（最长约 6.7 分钟）；仅对"提交阶段"错误重试。
+  for _attempt in $(seq 1 20); do
+    set -o pipefail
+    # --working-dir 必须显式指定：不指定时 job 的 cwd 取决于 ray head 进程
+    # 的启动目录（随 chain 启动位置漂移），曾导致 can't open train.py。
+    if "${RAY_BIN}" job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+      --working-dir "${SLIME_DIR}" \
+      --runtime-env-json="${RUNTIME_ENV_JSON}" \
+      -- "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}" 2>&1 | tee "${RUN_ROOT}/train.log"; then
+      _submit_ok=1
+    else
+      # $? 必须在 else 分支内捕获：if 语句整体退出码恒为 0，
+      # 在 fi 之后取值只会得到 0，把失败显示成成功。
+      _rc=$?
+    fi
+    set +o pipefail
+    if (( _submit_ok == 1 )); then
+      break
+    fi
+    # 提交阶段的网关错误（500/504 等）视为 agent 未就绪，可重试；
+    # job 已开始运行后的失败不重试（避免重跑整场训练）。
+    if grep -qE "No available agent|status code 5[0-9][0-9]" "${RUN_ROOT}/train.log" 2>/dev/null; then
+      echo "Ray agent 未就绪（第 ${_attempt}/20 次，code=${_rc}），20s 后重试..." >&2
+      sleep 20
+    else
+      echo "错误: ${ALGO} ray job 运行失败 (code=${_rc})，不重试" >&2
+      break
+    fi
+  done
+  if (( _submit_ok != 1 )); then
+    return 2
+  fi
 
   trap - EXIT INT TERM
   cleanup
@@ -555,10 +765,12 @@ train_one() {
 eval_one() {
   local ALGO="$1"
   # 与本次训练实际使用的 RUN_ROOT 对齐（支持用户显式 RUN_ROOT 的场景）
-  local TRAIN_ROOT="${LAST_TRAIN_ROOT:-${RUNS_ROOT}/qwen35_2b_shop_rl_${ALGO}}"
+  local TRAIN_ROOT="${LAST_TRAIN_ROOT:-${RUNS_ROOT}/qwen35_2b_shop_rl_${ALGO}${RUN_TAG}}"
   local HF_DIR="${TRAIN_ROOT}/hf"
   local LAST_ID
-  LAST_ID="$(ls "${HF_DIR}" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1)"
+  # || true 防 set -e+pipefail：HF 目录不存在/为空时 grep 无匹配会直接杀死
+  # 整个脚本，而不是走下面的友好报错分支。
+  LAST_ID="$(ls "${HF_DIR}" 2>/dev/null | { grep -oE '[0-9]+' || true; } | sort -n | tail -1)"
   if [[ -z "${LAST_ID}" ]]; then
     say "错误: ${HF_DIR} 下没有任何 rollout 导出，跳过评测 ${ALGO}"
     return 1
@@ -573,28 +785,57 @@ eval_one() {
       PI_BIN="${PI_BIN}" \
       EVAL_CHECKPOINT="${TRAIN_ROOT}/checkpoints" \
       HF_CHECKPOINT="${HF_DIR}/rollout_${LAST_ID}" \
-      RUN_ROOT="${RUNS_ROOT}/eval_rl_${ALGO}" \
-      RAY_TEMP_DIR="${BASE_DIR}/ray/eval_${ALGO}" \
-      ./examples/ShopSimulator/run_eval.sh > "${LOG_DIR}/eval_rl_${ALGO}.log" 2>&1 ) || EVAL_RC=$?
+      RUN_ROOT="${RUNS_ROOT}/eval_rl_${ALGO}${RUN_TAG}" \
+      RAY_TEMP_DIR="${BASE_DIR}/ray/e_${ALGO}${RUN_TAG}" \
+      ./examples/ShopSimulator/run_eval.sh > "${LOG_DIR}/eval_rl_${ALGO}${RUN_TAG}.log" 2>&1 ) || EVAL_RC=$?
+  if [[ "${EVAL_RC}" != "0" ]]; then
+    # 护栏：评测失败时严禁对可能存在的旧 rollout dump 做 summarize——
+    # 那会把历史结果冒充本次输出。
+    say "评测 ${ALGO} 失败 (code=${EVAL_RC})，跳过 summarize 以防误用旧结果"
+    return "${EVAL_RC}"
+  fi
   ( cd "${SLIME_DIR}" && "${SLIME_PYTHON}" -m examples.ShopSimulator.utils summarize \
-      --run-root "${RUNS_ROOT}/eval_rl_${ALGO}" \
-      >> "${LOG_DIR}/eval_rl_${ALGO}.log" 2>&1 ) || true
-  say "评测 ${ALGO} 结束 (code=${EVAL_RC})，结果: ${RUNS_ROOT}/eval_rl_${ALGO}/eval_results.json"
+      --run-root "${RUNS_ROOT}/eval_rl_${ALGO}${RUN_TAG}" \
+      >> "${LOG_DIR}/eval_rl_${ALGO}${RUN_TAG}.log" 2>&1 ) || true
+  say "评测 ${ALGO} 结束 (code=${EVAL_RC})，结果: ${RUNS_ROOT}/eval_rl_${ALGO}${RUN_TAG}/eval_results.json"
   return "${EVAL_RC}"
 }
 
 # ── 主流程 ────────────────────────────────────────────────────────
 command -v nvidia-smi >/dev/null || { echo "nvidia-smi is required" >&2; exit 2; }
 [[ -x "${RAY_BIN}" ]] || { echo "ray is required: ${RAY_BIN}" >&2; exit 2; }
+# 关键路径预检：配错只会在 job **运行中**才暴露（rollout 起不来 / import 失败），
+# 与 CUDA_HOME 同类隐蔽。这里提前 fail fast。
+[[ -x "${SLIME_PYTHON}" ]] || { echo "错误: SLIME_PYTHON 不可执行: ${SLIME_PYTHON}" >&2; exit 2; }
+[[ -d "${MEGATRON_DIR}" ]] || { echo "错误: MEGATRON_DIR 不存在: ${MEGATRON_DIR}" >&2; exit 2; }
+# 注：PI_BIN 的可执行校验已在参数构建阶段完成（见文件上方 "pi is required"）。
 
 export PYTHONUNBUFFERED=1
 export PI_BIN
-export CUDA_HOME="${CUDA_HOME:-${MAMBA_ROOT_PREFIX}/envs/slime}"
+# CUDA_HOME 必须含 nvcc：SGLang/flashinfer 的 CUDA graph JIT 在**运行中**才编译，
+# 路径错误会让 server 启动阶段崩溃，且错误埋在 SGLang 日志里难以定位
+# （2026-09-22 实测：MAMBA_ROOT_PREFIX 指向 /home/... 而实际 env 在 /hdd/...，
+# 默认值 ${MAMBA_ROOT_PREFIX}/envs/slime 下没有 nvcc）。故改为探测 + 前置校验。
+if [[ -z "${CUDA_HOME:-}" ]]; then
+  for _CUDA_CAND in "${BASE_DIR}/cuda" /usr/local/cuda "${MAMBA_ROOT_PREFIX}/envs/slime"; do
+    if [[ -x "${_CUDA_CAND}/bin/nvcc" ]]; then
+      CUDA_HOME="${_CUDA_CAND}"
+      break
+    fi
+  done
+fi
+if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+  echo "错误: 找不到可用的 nvcc（CUDA_HOME=${CUDA_HOME:-未设置}）；SGLang/flashinfer 的 JIT 编译会失败，请显式设置 CUDA_HOME=/usr/local/cuda" >&2
+  exit 2
+fi
+export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${HOME}/.local/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${LD_LIBRARY_PATH:-/usr/local/cuda/lib64}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export SHOP_ENV_URL SHOP_MAX_TURNS="${MAX_MODEL_TURNS}"
 export SHOP_CONTEXT_KEEP_ACT_RESULTS="${KEEP_ACT_RESULTS}"
+# R5 结构化记忆：历史 shop_act 结果压成候选摘要行（默认 1；置 0 回退旧占位符）。
+export SHOP_CONTEXT_STRUCTURED_MEMORY="${SHOP_CONTEXT_STRUCTURED_MEMORY:-1}"
 export SHOP_ROLLOUT_TIMEOUT_SEC="${ROLLOUT_TIMEOUT_SEC}"
 export SHOP_REQUIRE_NONZERO_VARIANCE_PER_ROLLOUT=0
 # 默认开启采样轨迹落盘：事件流 + 每轮上下文快照会写入 rollout_dumps 的 metadata。
@@ -639,9 +880,13 @@ if [[ "${ALGORITHM}" == "all" ]]; then
     printf '  %-12s %s\n' "${ALGO}" "${STATUS[${ALGO}]}"
   done
 else
-  train_one "${ALGORITHM}"
+  # 单算法模式：训练失败直接退出（此前会被吞掉、评测继续跑、chain 记 code=0）
+  if ! train_one "${ALGORITHM}"; then
+    say "训练 ${ALGORITHM} 失败（见上方错误与 ${LOG_DIR} 下日志）"
+    exit 2
+  fi
   if [[ "${AUTO_EVAL}" == "1" ]] && [[ "${CHECK_ONLY:-0}" != "1" ]]; then
     sleep 60
-    eval_one "${ALGORITHM}"
+    eval_one "${ALGORITHM}" || exit 3
   fi
 fi

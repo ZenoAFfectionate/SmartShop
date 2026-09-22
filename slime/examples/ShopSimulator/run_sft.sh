@@ -29,7 +29,11 @@ HF_CHECKPOINT="${HF_CHECKPOINT:-${BASE_DIR}/models/Qwen3.5-0.8B}"
 REF_MODEL_PATH="${REF_MODEL_PATH:-${BASE_DIR}/models/Qwen3.5-0.8B_torch_dist}"
 PROMPT_DATA="${FULL_DATA:-${SHOP_ROOT}/data/prepared/turn_examples.jsonl}"
 NUM_GPUS="${NUM_GPUS:-1}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-12288}"
+# 动态 batch 每 microbatch 的 token 上限。SFT 必须计算**全词表 logits**，
+# 峰值显存 ≈ max_tokens × vocab(151936) × 2B：8192→2.5GB、16384→5GB、
+# 32768→10GB（叠加激活/优化器后 48GB 卡必然 OOM，2026-09-22 实测）。
+# 默认保持历史的 8192；显存充裕时可用 env 覆盖，但请对照上表。
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4}"
 NUM_DATA_PASSES="${NUM_DATA_PASSES:-1}"
 
@@ -166,7 +170,7 @@ TRAIN_ARGS=(
 
 # B1 训练监控（wandb / tensorboard 备选）：SFT 无 rollout loop，不启用
 # multi-turn / passrate 日志。命名规范同 run_rl.sh。
-if [[ "${USE_WANDB}" == "1" ]]; then
+if [[ "${USE_WANDB:-0}" == "1" ]]; then
   TRAIN_ARGS+=(
     --use-wandb
     --wandb-mode "${WANDB_MODE:-offline}"
@@ -202,13 +206,52 @@ fi
 
 command -v nvidia-smi >/dev/null || { echo "nvidia-smi is required" >&2; exit 2; }
 [[ -x "${RAY_BIN}" ]] || { echo "ray is required: ${RAY_BIN}" >&2; exit 2; }
+# 关键路径预检：配错只会在 job **运行中**才暴露（import 失败等），与 CUDA_HOME
+# 同类隐蔽。SFT 不启动 agent，故无需校验 PI_BIN。这里提前 fail fast。
+[[ -x "${SLIME_PYTHON}" ]] || { echo "错误: SLIME_PYTHON 不可执行: ${SLIME_PYTHON}" >&2; exit 2; }
+[[ -d "${MEGATRON_DIR}" ]] || { echo "错误: MEGATRON_DIR 不存在: ${MEGATRON_DIR}" >&2; exit 2; }
+
+# GPU 占用预检：目标卡上已有进程时启动必然 OOM（与 max-tokens-per-gpu 过大会
+# 造成 OOM 并列为两类显存故障），与 run_rl.sh 的 check_gpu_free 同款防护。
+# 放在 CHECK_ONLY 之后：dry-run 只验证参数生成，不应被本机占用情况绑架。
+_SFT_GPU_INDEX="${CUDA_VISIBLE_DEVICES:-0}"
+_SFT_GPU_INDEX="${_SFT_GPU_INDEX%%,*}"
+_SFT_GPU_USED="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${_SFT_GPU_INDEX}" 2>/dev/null | tr -d ' ')"
+if [[ "${_SFT_GPU_USED}" =~ ^[0-9]+$ ]] && (( _SFT_GPU_USED > 2000 )); then
+  echo "错误: GPU ${_SFT_GPU_INDEX} 已被占用（${_SFT_GPU_USED} MiB）；如有正在运行的训练请先停止" >&2
+  exit 2
+fi
+# AF_UNIX socket 路径 ≤107 字符：temp_dir + session_<42 字符> + /sockets/
+# dash_MetricsHead 必须放得下，temp_dir 过长会让 dashboard 起不来、agent
+# 永远不就绪（2026-09-05 RL 评测实测）。放在 CHECK_ONLY 之后：dry-run 只
+# 验证参数生成，不应被本地临时路径长度绑架。
+if [[ ${#RAY_TEMP_DIR} -gt 40 ]]; then
+  echo "错误: RAY_TEMP_DIR 长度 ${#RAY_TEMP_DIR} > 40 字符，会导致 dashboard 无法启动：${RAY_TEMP_DIR}" >&2
+  exit 2
+fi
 if "${RAY_BIN}" status >/dev/null 2>&1; then
   echo "An existing Ray cluster is running; stop it first." >&2
   exit 2
 fi
 
 export PYTHONUNBUFFERED=1
-export CUDA_HOME="${CUDA_HOME:-${MAMBA_ROOT_PREFIX}/envs/slime}"
+# CUDA_HOME 必须含 nvcc：SGLang/flashinfer 的 CUDA graph JIT 在**运行中**才编译，
+# 路径错误会让 server 启动阶段崩溃，且错误埋在 SGLang 日志里难以定位
+# （2026-09-22 实测：MAMBA_ROOT_PREFIX 指向 /home/... 而实际 env 在 /hdd/...，
+# 默认值 ${MAMBA_ROOT_PREFIX}/envs/slime 下没有 nvcc）。故改为探测 + 前置校验。
+if [[ -z "${CUDA_HOME:-}" ]]; then
+  for _CUDA_CAND in "${BASE_DIR}/cuda" /usr/local/cuda "${MAMBA_ROOT_PREFIX}/envs/slime"; do
+    if [[ -x "${_CUDA_CAND}/bin/nvcc" ]]; then
+      CUDA_HOME="${_CUDA_CAND}"
+      break
+    fi
+  done
+fi
+if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+  echo "错误: 找不到可用的 nvcc（CUDA_HOME=${CUDA_HOME:-未设置}）；SGLang/flashinfer 的 JIT 编译会失败，请显式设置 CUDA_HOME=/usr/local/cuda" >&2
+  exit 2
+fi
+export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${HOME}/.local/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib:${LD_LIBRARY_PATH:-/usr/local/cuda/lib64}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
@@ -225,6 +268,13 @@ RAY_STARTED=0
 cleanup() {
   if (( RAY_STARTED == 1 )); then
     "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+    # 等待 GCS 进程真正退出：stop 返回时端口释放是异步的，不等待会让紧接着的
+    # 下一个实验 ray start 撞"端口被占用"（2026-09-04 run_rl chain 实测）。
+    local _w=0
+    while pgrep -f -- "temp_dir=${RAY_TEMP_DIR:-__none__}" >/dev/null 2>&1; do
+      (( _w >= 30 )) && break
+      sleep 2; _w=$(( _w + 2 ))
+    done
   fi
 }
 trap cleanup EXIT INT TERM
@@ -234,12 +284,47 @@ trap cleanup EXIT INT TERM
   --temp-dir "${RAY_TEMP_DIR}"
 RAY_STARTED=1
 
+# 等待 dashboard/agent 就绪：ray start 返回只代表 head 进程已拉起，
+# dashboard agent 注册完成前 job submit 会 500（No available agent）。
+# （与 run_rl.sh 同一防护；2026-09-03 曾在 RL 侧遇到同类失败。）
+_RAY_DEADLINE=$(( SECONDS + 120 ))
+until curl -sf -m 3 "http://127.0.0.1:8265/api/version" >/dev/null 2>&1; do
+  if (( SECONDS >= _RAY_DEADLINE )); then
+    echo "错误: Ray dashboard 在 120s 内未就绪，放弃提交 SFT 训练" >&2
+    exit 2
+  fi
+  sleep 3
+done
+
 RUNTIME_ENV_JSON="$("${SLIME_PYTHON}" -c 'import json, os; keys=("PYTHONPATH","PATH","CUDA_HOME","LD_LIBRARY_PATH","MASTER_ADDR","NO_PROXY","no_proxy","CUDA_DEVICE_MAX_CONNECTIONS","PYTORCH_CUDA_ALLOC_CONF","OMP_NUM_THREADS","NVTE_DEBUG","NVTE_DEBUG_LEVEL","WANDB_MODE","WANDB_API_KEY","WANDB_BASE_URL","TENSORBOARD_DIR"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
 
 cd "${SLIME_DIR}"
-"${RAY_BIN}" job submit --address=http://127.0.0.1:8265 \
-  --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}" 2>&1 | tee "${RUN_ROOT}/train.log"
+# --working-dir 必须显式指定：不指定时 job 的 cwd 取决于 ray head 进程的启动
+# 目录（随调用位置漂移），曾导致 can't open train.py。提交阶段的网关错误
+# （500/504 等）可重试；job 已开始运行后的失败不重试（避免重跑整场训练）。
+_SUBMIT_OK=0
+for _ATTEMPT in 1 2 3; do
+  if "${RAY_BIN}" job submit --address=http://127.0.0.1:8265 \
+    --working-dir "${SLIME_DIR}" \
+    --runtime-env-json="${RUNTIME_ENV_JSON}" \
+    -- "${SLIME_PYTHON}" -u train.py "${TRAIN_ARGS[@]}" 2>&1 | tee "${RUN_ROOT}/train.log"; then
+    _SUBMIT_OK=1
+  else
+    _RC=$?
+  fi
+  (( _SUBMIT_OK == 1 )) && break
+  if grep -qE "No available agent|status code 5[0-9][0-9]" "${RUN_ROOT}/train.log" 2>/dev/null; then
+    echo "Ray agent 未就绪（第 ${_ATTEMPT}/3 次，code=${_RC:-?}），20s 后重试..." >&2
+    sleep 20
+  else
+    echo "错误: SFT ray job 运行失败 (code=${_RC:-?})，不重试" >&2
+    break
+  fi
+done
+if (( _SUBMIT_OK != 1 )); then
+  echo "错误: SFT 训练提交失败（见 ${RUN_ROOT}/train.log）" >&2
+  exit 2
+fi
 
 printf 'SFT complete. HF exports: %s\nMegatron checkpoints: %s\n' \
   "${RUN_ROOT}/hf" "${RUN_ROOT}/checkpoints"

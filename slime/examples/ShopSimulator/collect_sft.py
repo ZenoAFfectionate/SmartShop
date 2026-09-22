@@ -20,8 +20,12 @@ from .pi_harness import (
     effective_system_prompt,
     run_pi,
 )
+from .shop_memory import build_memory_lines, structured_memory_enabled, summarize_shop_act_result
 
 SCHEMA_VERSION = 1
+# Legacy placeholder, kept for SHOP_CONTEXT_STRUCTURED_MEMORY=0 (must stay
+# byte-identical to the TS constant in shop_extension.ts).
+PRUNED_SHOP_ACT_RESULT = "[旧的 shop_act 工具结果已裁剪；done=false]"
 DEFAULT_PROMPT = "完成给定的购物任务。先调用 shop_reset，然后只使用 shop_act 与环境交互。"
 
 def read_index(path: Path) -> list[dict]:
@@ -108,6 +112,10 @@ def authoritative_messages(events: list[dict]) -> list[dict]:
         if not isinstance(message, dict) or not message.get("role"):
             continue
         cleaned = json.loads(json.dumps(message, ensure_ascii=False))
+        # shop_extension.ts never sends assistant `thinking` parts to the model,
+        # so drop them here too. `context_snapshots` applies the same filter on
+        # purpose: it is also invoked directly (tests, ad-hoc rebuilds) and must
+        # keep the "identical to what the model actually saw" contract alone.
         if cleaned.get("role") == "assistant" and isinstance(cleaned.get("content"), list):
             cleaned["content"] = [
                 part for part in cleaned["content"]
@@ -118,6 +126,13 @@ def authoritative_messages(events: list[dict]) -> list[dict]:
 
 
 def context_snapshots(messages: list[dict], keep_act_results: int) -> list[dict]:
+    """Rebuild per-assistant contexts exactly like the Pi extension does at
+    rollout time (shop_extension.ts). Older shop_act results become compact
+    memory lines (R5 structured memory) so SFT samples and RL rollouts see the
+    same context — the train/deploy distribution alignment this project
+    enforces. shop_memory.py mirrors the TS implementation byte-for-byte.
+    """
+    structured = structured_memory_enabled(os.environ.get("SHOP_CONTEXT_STRUCTURED_MEMORY"))
     snapshots = []
     for message_index, message in enumerate(messages):
         if message.get("role") != "assistant":
@@ -127,13 +142,63 @@ def context_snapshots(messages: list[dict], keep_act_results: int) -> list[dict]
             index for index, item in enumerate(context)
             if item.get("role") == "toolResult" and item.get("toolName") == "shop_act"
         ]
-        for index in act_results[:max(0, len(act_results) - keep_act_results)]:
-            context[index]["content"] = [{
-                "type": "text",
-                "text": "[旧的 shop_act 工具结果已裁剪；done=false]",
-            }]
+        pruned = act_results[:max(0, len(act_results) - keep_act_results)]
+        if structured:
+            call_actions = _collect_call_actions(context)
+            summaries = [
+                summarize_shop_act_result(
+                    _message_text(context[index]),
+                    call_actions.get(str(context[index].get("toolCallId") or ""), ""),
+                )
+                for index in pruned
+            ]
+            replacements = build_memory_lines(summaries)
+        else:
+            replacements = [PRUNED_SHOP_ACT_RESULT] * len(pruned)
+        for index, text in zip(pruned, replacements, strict=True):
+            context[index]["content"] = [{"type": "text", "text": text}]
+        # Mirror shop_extension.ts: assistant `thinking` parts never reach the
+        # model, so the rebuilt context must drop them too. Today's teacher runs
+        # with thinking disabled (thinking_blocks=0), but a reasoning teacher
+        # would otherwise make SFT contexts diverge from RL rollouts.
+        for item in context:
+            if item.get("role") != "assistant" or not isinstance(item.get("content"), list):
+                continue
+            filtered = [
+                part
+                for part in item["content"]
+                if not (isinstance(part, dict) and part.get("type") == "thinking")
+            ]
+            if len(filtered) != len(item["content"]):
+                item["content"] = filtered
         snapshots.append({"assistant_message_index": message_index, "messages": context})
     return snapshots
+
+
+def _collect_call_actions(messages: list[dict]) -> dict[str, str]:
+    """Map toolCallId → native action string (mirrors collectCallActions in TS)."""
+    actions: dict[str, str] = {}
+    for message in messages:
+        if message.get("role") != "assistant" or not isinstance(message.get("content"), list):
+            continue
+        for part in message["content"]:
+            if not isinstance(part, dict) or part.get("type") != "toolCall":
+                continue
+            call_id, args = part.get("id"), part.get("arguments")
+            if isinstance(call_id, str) and isinstance(args, dict) and isinstance(args.get("action"), str):
+                actions[call_id] = args["action"]
+    return actions
+
+
+def _message_text(message: dict) -> str:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        str(part.get("text") or "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    )
 
 
 
@@ -230,7 +295,52 @@ def _retryable(message: str) -> bool:
     return any(marker in lowered for marker in (
         "429", "rate limit", "too many requests", "connection", "timed out",
         "timeout", "502", "503", "504", "temporarily unavailable",
+        # 轮次耗尽是采样运气问题而非确定性失败：同配置重采约半数能完成
+        # （2026-09-22 补齐 512 任务时实测 7/14）。纳入重试后由 --max-attempts
+        # 控制次数，否则未完成的任务会以 attempts=1 静默落选。
+        "max model turns",
     ))
+
+
+def lineage_conflicts(
+    candidate: dict,
+    *,
+    args: argparse.Namespace,
+    keep_act_results: int,
+    structured_memory: bool,
+) -> list[str]:
+    """Report teacher/harness fields that differ from the current run.
+
+    Resumable collection reuses an existing trajectory verbatim, so a changed
+    teacher model or context format would silently mix two populations into one
+    dataset.
+    """
+    expected = {
+        "teacher": {
+            "provider": args.teacher_provider,
+            "model": args.model,
+            "base_url": args.base_url,
+            "context_window": args.context_window,
+            "max_tokens": args.max_tokens,
+        },
+        "harness": {
+            "context_keep_act_results": keep_act_results,
+            "max_turns": args.max_turns,
+            "context_structured_memory": structured_memory,
+        },
+    }
+    # Trajectories collected before the structured-memory switch carry no such
+    # field; they used the legacy placeholder context, i.e. False.
+    observed = {
+        "teacher": candidate.get("teacher") or {},
+        "harness": {"context_structured_memory": False, **(candidate.get("harness") or {})},
+    }
+    return [
+        f"{group}.{field}: {observed[group].get(field)!r} != {value!r}"
+        for group, fields in expected.items()
+        for field, value in fields.items()
+        if observed[group].get(field) != value
+    ]
 
 
 async def collect_one(
@@ -244,14 +354,24 @@ async def collect_one(
     task_id = int(row["metadata"]["task_id"])
     trajectory_id = f"sft-{task_id:06d}-{sample_id:03d}"
     destination = args.output_dir / "raw" / f"{task_id:06d}" / f"{sample_id:03d}.json"
-    if destination.exists():
-        return json.loads(destination.read_text(encoding="utf-8"))
-
     keep_act_results = (
         args.keep_act_results
         if args.keep_act_results is not None
         else int(os.environ.get("SHOP_CONTEXT_KEEP_ACT_RESULTS", "3"))
     )
+    structured_memory = structured_memory_enabled(os.environ.get("SHOP_CONTEXT_STRUCTURED_MEMORY"))
+    if destination.exists():
+        candidate = json.loads(destination.read_text(encoding="utf-8"))
+        conflicts = lineage_conflicts(
+            candidate, args=args, keep_act_results=keep_act_results, structured_memory=structured_memory
+        )
+        if conflicts and not args.allow_mixed_teacher:
+            raise ValueError(
+                f"{destination} was collected with a different teacher/harness configuration: "
+                + "; ".join(conflicts)
+                + ". Re-run with a fresh --output-dir, or pass --allow-mixed-teacher to reuse it anyway."
+            )
+        return candidate
     # Resolve once per candidate so messages, traces and the recorded harness
     # metadata all reflect the same prompt (SHOP_SYSTEM_PROMPT[_FILE] aware).
     system_prompt = effective_system_prompt()
@@ -331,7 +451,7 @@ async def collect_one(
         "sample_id": sample_id,
         "split": "sft",
         "teacher": {
-            "provider": "deepseek",
+            "provider": args.teacher_provider,
             "model": args.model,
             "base_url": args.base_url,
             "thinking": False,
@@ -341,6 +461,7 @@ async def collect_one(
         "harness": {
             "system_prompt": system_prompt,
             "context_keep_act_results": keep_act_results,
+            "context_structured_memory": structured_memory,
             "max_turns": args.max_turns,
             "timeout_sec": args.timeout,
         },
@@ -417,6 +538,15 @@ def export_results(output_dir: Path, candidates: list[dict], args: argparse.Name
     summary = {
         "schema_version": SCHEMA_VERSION,
         "teacher_model": args.model,
+        "teacher_base_url": args.base_url,
+        "teacher_provider": args.teacher_provider,
+        # With --allow-mixed-teacher the reuse path can pull in older
+        # trajectories; surfacing the full set keeps the mixture auditable.
+        "teacher_models_seen": sorted({
+            (row.get("teacher") or {}).get("model")
+            for row in ordered
+            if (row.get("teacher") or {}).get("model")
+        }),
         "candidates": len(ordered),
         "accepted": len(accepted),
         "tasks_attempted": len(task_ids),
@@ -511,13 +641,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="File whose first line is the teacher API key. Required unless --dry-run.",
     )
-    parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument(
+        "--model",
+        default="deepseek-flash",
+        help="Teacher model id as accepted by the provider API. The DeepSeek "
+             "endpoint supports 'deepseek-flash' (default, fast) and "
+             "'deepseek-v4-pro' (stronger, pricier). Any differing id counts as "
+             "a different teacher for the lineage check, so keep it stable "
+             "across a single dataset.",
+    )
     parser.add_argument(
         "--teacher-provider",
         default="deepseek",
         help="Pi provider id for the teacher endpoint. Any OpenAI-compatible "
              "base-url works, e.g. a local SGLang server for C5 "
              "self-improvement sampling.",
+    )
+    parser.add_argument(
+        "--allow-mixed-teacher",
+        action="store_true",
+        help="Reuse existing trajectories whose teacher model or harness settings "
+             "differ from this run. Default is to abort, so one dataset can never "
+             "silently mix teacher models or context formats.",
     )
     parser.add_argument("--base-url", default="https://api.deepseek.com")
     parser.add_argument("--env-url", default="http://127.0.0.1:5000/api/shop_agent")

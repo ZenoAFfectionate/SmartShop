@@ -1,12 +1,19 @@
 import { appendFileSync } from "node:fs";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildMemoryLines, structuredMemoryEnabled, summarizeShopActResult } from "./shop_memory";
 
 const SHOP_ENV_URL = process.env.SHOP_ENV_URL || "http://127.0.0.1:5000/api/shop_agent";
 const parsedKeepActResults = Number.parseInt(process.env.SHOP_CONTEXT_KEEP_ACT_RESULTS || "3", 10);
 const parsedTaskId = Number.parseInt(process.env.SHOP_TASK_ID || "", 10);
 const rolloutSessionId = process.env.SHOP_ROLLOUT_SESSION_ID || "";
 const contextTracePath = process.env.SHOP_CONTEXT_TRACE_PATH || "";
+// R5 structured memory: older shop_act results are replaced by a compact
+// candidate summary instead of a blank placeholder, so the model remembers
+// what it already searched/viewed (repeated-action loops are the direct cause
+// of every turn_limit trajectory). Set SHOP_CONTEXT_STRUCTURED_MEMORY=0 to
+// fall back to the legacy placeholder.
+const structuredMemory = structuredMemoryEnabled(process.env.SHOP_CONTEXT_STRUCTURED_MEMORY);
 if (!rolloutSessionId) {
 	throw new Error("SHOP_ROLLOUT_SESSION_ID must be a non-empty string");
 }
@@ -18,6 +25,19 @@ if (!Number.isInteger(parsedKeepActResults) || parsedKeepActResults < 1) {
 }
 
 const PRUNED_SHOP_ACT_RESULT = "[旧的 shop_act 工具结果已裁剪；done=false]";
+const COMPRESSION_VERSION = structuredMemory
+	? `keep-last-${parsedKeepActResults}-shop-act-results-v2-structured`
+	: `keep-last-${parsedKeepActResults}-shop-act-results-v1`;
+
+/** Concatenated text of a toolResult message (provider-agnostic). */
+function messageText(message: { content?: unknown }): string {
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.map((part) => (part && typeof part === "object" && (part as { type?: string }).type === "text"
+			? String((part as { text?: unknown }).text ?? "")
+			: ""))
+		.join("");
+}
 // Error-classification prefixes. These MUST stay byte-identical to the Python
 // side in slime/examples/ShopSimulator/pi_harness.py (INFRASTRUCTURE_ERROR_PREFIX
 // / AGENT_ERROR_PREFIX, used by _classify_tool_error): the harness decides
@@ -87,17 +107,65 @@ export default function (pi: ExtensionAPI) {
 	let envIdx: number | undefined;
 	let terminalResult: EnvResult | undefined;
 	let contextTraceIndex = 0;
+	// Single-result summary cache: the same history is re-processed on every
+	// model turn, and the page texts are kilobytes long, so re-parsing them
+	// each time would burn CPU on the adapter's single event loop.
+	const summaryCache = new Map<string, string>();
+	const SUMMARY_CACHE_LIMIT = 512;
+
+	const cachedSummary = (text: string, action: string): string => {
+		const key = `${action}\u0000${text}`;
+		const hit = summaryCache.get(key);
+		if (hit !== undefined) return hit;
+		const line = summarizeShopActResult(text, action);
+		if (summaryCache.size >= SUMMARY_CACHE_LIMIT) summaryCache.clear();
+		summaryCache.set(key, line);
+		return line;
+	};
+
+	/** Map toolCallId → native action string for the messages in one request. */
+	const collectCallActions = (messages: readonly { role?: string; content?: unknown }[]): Map<string, string> => {
+		const actions = new Map<string, string>();
+		for (const message of messages) {
+			if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+			for (const part of message.content) {
+				if (!part || typeof part !== "object") continue;
+				const candidate = part as { type?: string; id?: unknown; arguments?: unknown };
+				if (candidate.type !== "toolCall" || typeof candidate.id !== "string") continue;
+				const args = candidate.arguments;
+				if (args && typeof args === "object" && typeof (args as { action?: unknown }).action === "string") {
+					actions.set(candidate.id, (args as { action: string }).action);
+				}
+			}
+		}
+		return actions;
+	};
 
 	// Deterministic, non-destructive request-time pruning. Pi keeps the full
 	// in-process history and JSON events; only the copy sent to the model is
 	// shortened. Preserve toolResult messages and their call IDs so provider
-	// tool-call pairing remains valid.
+	// tool-call pairing remains valid. Older shop_act results are replaced by
+	// compact memory lines (structured memory) or a placeholder when disabled.
 	pi.on("context", async (event) => {
 		const shopActResultIndices = event.messages
 			.map((message, index) => message.role === "toolResult" && message.toolName === "shop_act" ? index : -1)
 			.filter((index) => index >= 0);
 		const pruneBefore = Math.max(0, shopActResultIndices.length - parsedKeepActResults);
-		const prunedIndices = new Set(shopActResultIndices.slice(0, pruneBefore));
+		const prunedIndices = shopActResultIndices.slice(0, pruneBefore);
+		const replacements = new Map<number, string>();
+		if (structuredMemory) {
+			const callActions = collectCallActions(event.messages);
+			const summaries = prunedIndices.map((index) => {
+				const message = event.messages[index] as { toolCallId?: unknown };
+				const action = typeof message.toolCallId === "string" ? callActions.get(message.toolCallId) ?? "" : "";
+				return cachedSummary(messageText(message), action);
+			});
+			buildMemoryLines(summaries).forEach((line, position) => {
+				replacements.set(prunedIndices[position], line);
+			});
+		} else {
+			prunedIndices.forEach((index) => replacements.set(index, PRUNED_SHOP_ACT_RESULT));
+		}
 		let changed = false;
 		const messages = event.messages.map((message, index) => {
 			if (message.role === "assistant" && Array.isArray(message.content)) {
@@ -107,11 +175,11 @@ export default function (pi: ExtensionAPI) {
 					return { ...message, content };
 				}
 			}
-			if (prunedIndices.has(index) && message.role === "toolResult") {
+			if (replacements.has(index) && message.role === "toolResult") {
 				changed = true;
 				return {
 					...message,
-					content: [{ type: "text", text: PRUNED_SHOP_ACT_RESULT }],
+					content: [{ type: "text", text: replacements.get(index) as string }],
 				};
 			}
 			return message;
@@ -120,7 +188,7 @@ export default function (pi: ExtensionAPI) {
 			appendFileSync(contextTracePath, `${JSON.stringify({
 				schema_version: 1,
 				request_index: contextTraceIndex++,
-				compression_version: `keep-last-${parsedKeepActResults}-shop-act-results-v1`,
+				compression_version: COMPRESSION_VERSION,
 				messages,
 			})}\n`, { encoding: "utf8", mode: 0o600 });
 		}

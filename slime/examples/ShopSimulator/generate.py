@@ -56,6 +56,16 @@ DECOMPOSED_ADVANTAGE_WEIGHT = float(os.environ.get("SHOP_DECOMPOSED_ADVANTAGE_WE
 # metrics stay pure environment rewards. 0 = fully off (legacy behaviour).
 BEHAVIOR_DELTA = float(os.environ.get("SHOP_BEHAVIOR_DELTA", "0") or 0)
 
+# Training reward metric. "loose" (default) keeps the env's scalar additive
+# reward as the RL signal; "hard" swaps it for the multiplicative product of
+# the four sub-scores (r_type*r_att*r_option*r_price — the same quantity
+# common.py reports as eval "r_hard") for candidates carrying a complete
+# reward_detail. Unfinished candidates (reward 0, no detail) stay 0.0. Eval
+# metrics always report both r_loose and r_hard regardless of this switch.
+REWARD_METRIC = os.environ.get("SHOP_REWARD_METRIC", "loose").strip().lower()
+if REWARD_METRIC not in ("loose", "hard"):
+    raise ValueError(f"SHOP_REWARD_METRIC must be 'loose' or 'hard', got {REWARD_METRIC!r}")
+
 DECOMPOSED_DIMENSIONS = ("r_type", "r_att", "r_option", "r_price")
 
 
@@ -206,10 +216,33 @@ def _decomposed_group_advantages(
     return result
 
 
+def _hard_reward(detail: dict) -> float | None:
+    """Multiplicative r_hard = r_type*r_att*r_option*r_price (eval 口径, common.py).
+    Returns None when any sub-score is missing (candidate was not scored)."""
+    values = [detail.get(dim) for dim in DECOMPOSED_DIMENSIONS]
+    if not all(isinstance(v, numbers.Real) for v in values):
+        return None
+    result = 1.0
+    for value in values:
+        result *= float(value)
+    return result
+
+
 def normalize_candidate_group_rewards(args, samples: list[Sample]):
     """Normalize complete candidate groups; filtered groups receive zero advantage."""
     expected = int(args.n_samples_per_prompt)
     raw_rewards = [float(sample.get_reward_value(args)) for sample in samples]
+    if REWARD_METRIC == "hard":
+        # R-hard experiment: the *training signal* becomes the multiplicative
+        # reward. Unfinished candidates (reward 0, no reward_detail) keep 0.0;
+        # sample.reward itself is untouched, so dumps, group validation and
+        # eval metrics all keep reporting the env reward.
+        for position, sample in enumerate(samples):
+            if raw_rewards[position] == 0.0:
+                continue
+            hard = _hard_reward((sample.metadata or {}).get("reward_detail") or {})
+            if hard is not None:
+                raw_rewards[position] = hard
     grouped: dict[int, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
     for position, sample in enumerate(samples):
         if sample.group_index is None:

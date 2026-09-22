@@ -9,6 +9,7 @@ import json
 import pytest
 
 from examples.ShopSimulator.collect_sft import (
+    PRUNED_SHOP_ACT_RESULT,
     _event_call_id,
     _event_tool_name,
     _retryable,
@@ -17,10 +18,12 @@ from examples.ShopSimulator.collect_sft import (
     atomic_write_jsonl,
     authoritative_messages,
     build_parser,
+    collect_one,
     context_snapshots,
     context_trace_matches,
     evaluate_candidate,
     export_results,
+    lineage_conflicts,
     normalize_context_traces,
     read_index,
 )
@@ -158,7 +161,8 @@ class TestContextSnapshots:
         messages.append({"role": "assistant", "content": [{"type": "text", "text": "final"}]})
         return messages
 
-    def test_old_act_results_are_pruned(self):
+    def test_old_act_results_are_pruned(self, monkeypatch):
+        monkeypatch.setenv("SHOP_CONTEXT_STRUCTURED_MEMORY", "0")
         messages = self.messages_with_acts(5)
         snapshots = context_snapshots(messages, keep_act_results=2)
         assert len(snapshots) == 6  # one snapshot per assistant message
@@ -173,6 +177,23 @@ class TestContextSnapshots:
         assert "act-result-3" in act_texts and "act-result-4" in act_texts
         assert "act-result-0" not in act_texts
         assert sum("已裁剪" in text for text in act_texts) == 3
+
+    def test_old_act_results_become_memory_lines_by_default(self, monkeypatch):
+        monkeypatch.setenv("SHOP_CONTEXT_STRUCTURED_MEMORY", "1")
+        messages = self.messages_with_acts(5)
+        snapshots = context_snapshots(messages, keep_act_results=2)
+        act_texts = [
+            part["text"]
+            for message in snapshots[-1]["messages"]
+            if message.get("role") == "toolResult" and message.get("toolName") == "shop_act"
+            for part in message["content"]
+        ]
+        assert "act-result-3" in act_texts and "act-result-4" in act_texts
+        # raw text is replaced by a memory line (which may quote it as content)
+        assert not any(text == "act-result-0" for text in act_texts)
+        memory = [text for text in act_texts if text.startswith("[记忆]")]
+        assert len(memory) == 3
+        assert "[记忆] act: act-result-0" in memory
 
     def test_keep_all_when_fewer_than_budget(self):
         messages = self.messages_with_acts(1)
@@ -190,6 +211,83 @@ class TestContextSnapshots:
         before = json.dumps(messages)
         context_snapshots(messages, keep_act_results=1)
         assert json.dumps(messages) == before
+
+    def test_thinking_parts_are_stripped_like_the_extension(self, monkeypatch):
+        # shop_extension.ts drops assistant `thinking` parts before sending, so
+        # the Python rebuild must drop them too — otherwise a reasoning teacher
+        # would make SFT contexts diverge from RL rollout contexts.
+        monkeypatch.setenv("SHOP_CONTEXT_STRUCTURED_MEMORY", "1")
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "任务"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "text": "内部推理"},
+                    {"type": "text", "text": "可见回答"},
+                ],
+            },
+            {
+                "role": "toolResult",
+                "toolName": "shop_act",
+                "toolCallId": "c1",
+                "content": [{"type": "text", "text": "act-result-0"}],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "收尾"}]},
+        ]
+        snapshots = context_snapshots(messages, keep_act_results=1)
+        assistants = [m for m in snapshots[-1]["messages"] if m.get("role") == "assistant"]
+        assert assistants, "assistant messages must survive the rebuild"
+        assert [part["type"] for part in assistants[0]["content"]] == ["text"]
+        assert all(
+            part.get("type") != "thinking"
+            for message in assistants
+            for part in message["content"]
+        )
+
+    def test_every_assistant_thinking_part_is_stripped(self, monkeypatch):
+        monkeypatch.setenv("SHOP_CONTEXT_STRUCTURED_MEMORY", "1")
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "任务"}]},
+            {"role": "assistant", "content": [{"type": "thinking", "text": "t1"}, {"type": "text", "text": "a1"}]},
+            {"role": "toolResult", "toolName": "shop_act", "toolCallId": "c1", "content": [{"type": "text", "text": "r1"}]},
+            {"role": "assistant", "content": [{"type": "thinking", "text": "t2"}]},
+            {"role": "toolResult", "toolName": "shop_act", "toolCallId": "c2", "content": [{"type": "text", "text": "r2"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "a3"}]},
+        ]
+        rebuilt = context_snapshots(messages, keep_act_results=1)[-1]["messages"]
+        assert all(
+            part.get("type") != "thinking"
+            for message in rebuilt
+            if message.get("role") == "assistant"
+            for part in message["content"]
+        )
+
+    def test_keep_zero_compresses_every_act_result(self, monkeypatch):
+        # keep_act_results=0 means nothing survives verbatim — every result must
+        # become a memory line (structured) instead of leaking raw text.
+        monkeypatch.setenv("SHOP_CONTEXT_STRUCTURED_MEMORY", "1")
+        messages = self.messages_with_acts(3)
+        snapshots = context_snapshots(messages, keep_act_results=0)
+        texts = [
+            part["text"]
+            for message in snapshots[-1]["messages"]
+            if message.get("role") == "toolResult"
+            for part in message["content"]
+        ]
+        assert texts, "the fixture must contain act results"
+        assert all(text.startswith("[记忆]") for text in texts)
+
+    def test_legacy_mode_marks_every_pruned_result(self, monkeypatch):
+        monkeypatch.setenv("SHOP_CONTEXT_STRUCTURED_MEMORY", "0")
+        messages = self.messages_with_acts(3)
+        snapshots = context_snapshots(messages, keep_act_results=0)
+        texts = [
+            part["text"]
+            for message in snapshots[-1]["messages"]
+            if message.get("role") == "toolResult"
+            for part in message["content"]
+        ]
+        assert all(text == PRUNED_SHOP_ACT_RESULT for text in texts)
 
 
 class TestContextTraces:
@@ -339,6 +437,8 @@ class TestRetryable:
             "503",
             "504",
             "temporarily unavailable",
+            # turn exhaustion is a sampling-luck failure: ~half of retries finish
+            "pi reached max model turns (40)",
         ]:
             assert _retryable(text), text
 
@@ -365,7 +465,10 @@ class TestExportResults:
         }
 
     def test_export_writes_accepted_and_summary(self, tmp_path):
-        args = argparse.Namespace(model="deepseek-v4-flash", max_turns=40)
+        args = argparse.Namespace(
+            model="deepseek-flash", max_turns=40,
+            teacher_provider="deepseek", base_url="https://api.deepseek.com",
+        )
         candidates = [
             self._candidate(1, 0, True),
             self._candidate(1, 1, False, done=False),
@@ -383,8 +486,25 @@ class TestExportResults:
         assert json.loads(accepted_lines[0])["metadata"]["task_id"] == 1
         assert (tmp_path / "summary.json").is_file()
 
+    def test_summary_records_every_teacher_model_seen(self, tmp_path):
+        # With --allow-mixed-teacher a resumed run can reuse older trajectories;
+        # the summary must show both models so the mixture stays auditable.
+        args = argparse.Namespace(
+            model="deepseek-flash", max_turns=40,
+            teacher_provider="deepseek", base_url="https://api.deepseek.com",
+        )
+        candidates = [self._candidate(1, 0, True), self._candidate(2, 0, True)]
+        candidates[0]["teacher"] = {"model": "deepseek-flash"}
+        candidates[1]["teacher"] = {"model": "legacy-teacher"}
+        summary = export_results(tmp_path, candidates, args)
+        assert summary["teacher_models_seen"] == ["deepseek-flash", "legacy-teacher"]
+        assert summary["teacher_model"] == "deepseek-flash"
+
     def test_export_uncovered_tasks(self, tmp_path):
-        args = argparse.Namespace(model="deepseek-v4-flash", max_turns=40)
+        args = argparse.Namespace(
+            model="deepseek-flash", max_turns=40,
+            teacher_provider="deepseek", base_url="https://api.deepseek.com",
+        )
         candidates = [
             self._candidate(1, 0, False, done=False, tool_calls=40),
             self._candidate(2, 0, True),
@@ -415,6 +535,135 @@ class TestParserDefaults:
     def test_keep_act_results_defaults_to_none(self):
         args = build_parser().parse_args(["--output-dir", "/tmp/x"])
         assert args.keep_act_results is None
+
+    def test_default_teacher_model(self):
+        args = build_parser().parse_args(["--output-dir", "/tmp/x"])
+        assert args.model == "deepseek-flash"
+
+    def test_mixed_teacher_is_rejected_by_default(self):
+        args = build_parser().parse_args(["--output-dir", "/tmp/x"])
+        assert args.allow_mixed_teacher is False
+
+    def test_mixed_teacher_flag_enables_reuse(self):
+        args = build_parser().parse_args(["--output-dir", "/tmp/x", "--allow-mixed-teacher"])
+        assert args.allow_mixed_teacher is True
+
+
+class TestLineageGuard:
+    """Resumable collection must never silently mix teacher models or context
+    formats into one dataset (trajectories are reused verbatim)."""
+
+    @staticmethod
+    def _args(tmp_path, **overrides):
+        values = dict(
+            output_dir=tmp_path,
+            model="deepseek-flash",
+            max_turns=40,
+            teacher_provider="deepseek",
+            base_url="https://api.deepseek.com",
+            context_window=262144,
+            max_tokens=32768,
+            keep_act_results=None,
+            allow_mixed_teacher=False,
+        )
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    @staticmethod
+    def _candidate(model="deepseek-flash"):
+        harness = {
+            "context_keep_act_results": 3,
+            "context_structured_memory": True,
+            "max_turns": 40,
+            "system_prompt": "s",
+        }
+        return {
+            "teacher": {
+                "provider": "deepseek", "model": model, "base_url": "https://api.deepseek.com",
+                "context_window": 262144, "max_tokens": 32768, "thinking": False,
+            },
+            "harness": harness,
+        }
+
+    def test_matching_candidate_is_reusable(self, tmp_path):
+        conflicts = lineage_conflicts(
+            self._candidate(), args=self._args(tmp_path), keep_act_results=3, structured_memory=True
+        )
+        assert conflicts == []
+
+    @pytest.mark.parametrize("group,field,stale_value", [
+        ("teacher", "provider", "other-provider"),
+        ("teacher", "model", "legacy-teacher"),
+        ("teacher", "base_url", "https://example.invalid"),
+        ("teacher", "context_window", 8192),
+        ("teacher", "max_tokens", 1024),
+        ("harness", "context_keep_act_results", 1),
+        ("harness", "max_turns", 20),
+        ("harness", "context_structured_memory", False),
+    ])
+    def test_every_fingerprint_field_is_checked(self, tmp_path, group, field, stale_value):
+        candidate = self._candidate()
+        candidate[group][field] = stale_value
+        conflicts = lineage_conflicts(
+            candidate, args=self._args(tmp_path), keep_act_results=3, structured_memory=True
+        )
+        assert any(item.startswith(f"{group}.{field}:") for item in conflicts), conflicts
+
+    def test_reported_conflict_shows_both_values(self, tmp_path):
+        conflicts = lineage_conflicts(
+            self._candidate(model="legacy-teacher"),
+            args=self._args(tmp_path), keep_act_results=3, structured_memory=True,
+        )
+        assert conflicts == ["teacher.model: 'legacy-teacher' != 'deepseek-flash'"]
+
+    def test_legacy_candidate_matches_legacy_run(self, tmp_path):
+        # Trajectories predating the structured-memory switch carry no field.
+        harness = {"context_keep_act_results": 3, "max_turns": 40, "system_prompt": "s"}
+        candidate = {
+            "teacher": self._candidate()["teacher"],
+            "harness": harness,
+        }
+        assert lineage_conflicts(
+            candidate, args=self._args(tmp_path), keep_act_results=3, structured_memory=False
+        ) == []
+        assert lineage_conflicts(
+            candidate, args=self._args(tmp_path), keep_act_results=3, structured_memory=True
+        ) != []
+
+    def test_keep_act_results_change_is_reported(self, tmp_path):
+        conflicts = lineage_conflicts(
+            self._candidate(), args=self._args(tmp_path), keep_act_results=1, structured_memory=True
+        )
+        assert any("harness.context_keep_act_results" in item for item in conflicts)
+
+    def test_collect_one_aborts_then_reuses_with_flag(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SHOP_CONTEXT_KEEP_ACT_RESULTS", "3")
+        monkeypatch.setenv("SHOP_CONTEXT_STRUCTURED_MEMORY", "1")
+        raw = tmp_path / "raw" / "000001"
+        raw.mkdir(parents=True)
+        stale = self._candidate(model="legacy-teacher")
+        (raw / "000.json").write_text(json.dumps(stale), encoding="utf-8")
+        row = {"metadata": {"task_id": 1}}
+
+        args = self._args(tmp_path)
+        with pytest.raises(ValueError, match="different teacher/harness"):
+            asyncio.run(collect_one(row=row, sample_id=0, args=args, api_key="k", limiter=None))
+
+        args.allow_mixed_teacher = True
+        reused = asyncio.run(collect_one(row=row, sample_id=0, args=args, api_key="k", limiter=None))
+        assert reused["teacher"]["model"] == "legacy-teacher"
+
+    def test_collect_one_reuses_matching_candidate(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SHOP_CONTEXT_KEEP_ACT_RESULTS", "3")
+        monkeypatch.setenv("SHOP_CONTEXT_STRUCTURED_MEMORY", "1")
+        raw = tmp_path / "raw" / "000001"
+        raw.mkdir(parents=True)
+        (raw / "000.json").write_text(json.dumps(self._candidate()), encoding="utf-8")
+        reused = asyncio.run(collect_one(
+            row={"metadata": {"task_id": 1}}, sample_id=0,
+            args=self._args(tmp_path), api_key="k", limiter=None,
+        ))
+        assert reused["teacher"]["model"] == "deepseek-flash"
 
 
 def write_tasks(tmp_path) -> object:

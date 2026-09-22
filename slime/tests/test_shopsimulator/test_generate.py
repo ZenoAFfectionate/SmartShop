@@ -14,6 +14,7 @@ from examples.ShopSimulator.generate import (
     _candidate_fragments,
     _capture_rollout_events_enabled,
     _decomposed_group_advantages,
+    _hard_reward,
     _sample_prompt,
     _task_id,
     abort_sample,
@@ -139,6 +140,122 @@ class TestNormalizeCandidateGroupRewards:
         sample.group_index = None
         with pytest.raises(RuntimeError, match="group_index"):
             normalize_candidate_group_rewards(make_args(), [sample])
+
+
+class TestRewardMetricHard:
+    """SHOP_REWARD_METRIC=hard swaps the *training signal* to the multiplicative
+    r_hard (product of the four sub-scores); loose keeps the env reward."""
+
+    @staticmethod
+    def _group(rewards_details):
+        samples = []
+        for candidate, (reward, detail) in enumerate(rewards_details):
+            sample = make_sample(group_index=0, rollout_id=candidate, index=candidate, reward=reward)
+            if detail is not None:
+                sample.metadata["reward_detail"] = detail
+            samples.append(sample)
+        return samples
+
+    def test_hard_reward_swaps_training_signal(self, monkeypatch):
+        monkeypatch.setattr(generate_module, "REWARD_METRIC", "hard")
+        # env rewards identical (zero loose variance) but sub-scores differ:
+        # r_hard = 0.25 vs 1.0 → the group carries gradient only under hard.
+        full = {"r_type": 1.0, "r_att": 1.0, "r_option": 1.0, "r_price": 1.0}
+        partial = {"r_type": 1.0, "r_att": 0.5, "r_option": 0.5, "r_price": 1.0}
+        samples = self._group([(0.7, partial), (0.7, full), (0.7, partial), (0.7, full)])
+        raw, normalized = normalize_candidate_group_rewards(make_args(), samples)
+        assert raw == [0.25, 1.0, 0.25, 1.0]
+        assert normalized[0] < 0 < normalized[1]
+
+    def test_loose_default_ignores_detail(self, monkeypatch):
+        monkeypatch.setattr(generate_module, "REWARD_METRIC", "loose")
+        full = {"r_type": 1.0, "r_att": 1.0, "r_option": 1.0, "r_price": 1.0}
+        samples = self._group([(0.7, full), (0.7, full), (0.7, None), (0.3, full)])
+        raw, _ = normalize_candidate_group_rewards(make_args(), samples)
+        assert raw == [0.7, 0.7, 0.7, 0.3]  # env reward untouched
+
+    def test_unfinished_candidates_keep_zero(self, monkeypatch):
+        monkeypatch.setattr(generate_module, "REWARD_METRIC", "hard")
+        full = {"r_type": 1.0, "r_att": 1.0, "r_option": 1.0, "r_price": 1.0}
+        half = {"r_type": 0.5, "r_att": 1.0, "r_option": 1.0, "r_price": 1.0}
+        samples = self._group([(0.0, None), (1.0, full), (0.0, None), (0.5, half)])
+        raw, _ = normalize_candidate_group_rewards(make_args(), samples)
+        assert raw == [0.0, 1.0, 0.0, 0.5]
+
+    def test_sample_reward_not_mutated(self, monkeypatch):
+        # dumps and eval metrics keep reporting the env reward even though the
+        # advantage was computed from the swapped r_hard signal.
+        monkeypatch.setattr(generate_module, "REWARD_METRIC", "hard")
+        full = {"r_type": 1.0, "r_att": 1.0, "r_option": 1.0, "r_price": 1.0}
+        partial = {"r_type": 1.0, "r_att": 0.5, "r_option": 0.5, "r_price": 1.0}
+        samples = self._group([(0.7, partial), (0.7, full), (0.7, partial), (0.7, full)])
+        normalize_candidate_group_rewards(make_args(), samples)
+        assert all(sample.reward == 0.7 for sample in samples)
+
+    def test_hard_reward_helper(self):
+        assert _hard_reward({"r_type": 0.5, "r_att": 0.5, "r_option": 1.0, "r_price": 1.0}) == 0.25
+        assert _hard_reward({}) is None
+        assert _hard_reward({"r_type": 1.0}) is None  # incomplete sub-scores
+
+    def test_hard_fanout_fragments_consistent(self, monkeypatch):
+        # one candidate split into two fragments: both carry the same
+        # reward_detail → identical swapped value, no "inconsistent reward" raise
+        monkeypatch.setattr(generate_module, "REWARD_METRIC", "hard")
+        full = {"r_type": 1.0, "r_att": 1.0, "r_option": 1.0, "r_price": 1.0}
+        partial = {"r_type": 1.0, "r_att": 0.5, "r_option": 0.5, "r_price": 1.0}
+        frag_a = make_sample(group_index=0, rollout_id=0, index=0, reward=0.7)
+        frag_b = make_sample(group_index=0, rollout_id=0, index=1, reward=0.7)
+        other = make_sample(group_index=0, rollout_id=1, index=2, reward=0.3)
+        for sample, detail in ((frag_a, full), (frag_b, full), (other, partial)):
+            sample.metadata["reward_detail"] = detail
+        fourth = make_sample(group_index=0, rollout_id=2, index=3, reward=0.9)
+        fourth.metadata["reward_detail"] = full
+        samples = [frag_a, frag_b, other, fourth]
+        # 3 candidates (candidate 0 has two fan-out fragments), not 4
+        raw, _ = normalize_candidate_group_rewards(make_args(n_samples_per_prompt=3), samples)
+        assert raw[0] == raw[1] == 1.0  # both fragments swapped identically
+        assert raw[2] == 0.25 and raw[3] == 1.0  # 1.0*0.5*0.5*1.0 = 0.25
+
+    def test_hard_blends_with_decomposed_advantage(self, monkeypatch):
+        # R1-2 (w=0.5) stacked on the hard signal: the result must differ from
+        # both the loose run and the pure-hard run — the two features compose.
+        monkeypatch.setattr(generate_module, "REWARD_METRIC", "hard")
+        full = {"r_type": 1.0, "r_att": 1.0, "r_option": 1.0, "r_price": 1.0}
+        partial = {"r_type": 1.0, "r_att": 0.5, "r_option": 0.5, "r_price": 1.0}
+        samples = self._group([(0.7, partial), (0.7, full), (0.7, partial), (0.7, full)])
+        _, hard_only = normalize_candidate_group_rewards(make_args(), samples)
+        monkeypatch.setattr(generate_module, "DECOMPOSED_ADVANTAGE_WEIGHT", 0.5)
+        _, blended = normalize_candidate_group_rewards(make_args(), samples)
+        assert any(abs(a - b) > 1e-9 for a, b in zip(hard_only, blended))
+        assert sum(blended) == pytest.approx(0.0, abs=1e-6)
+
+    def test_hard_with_behavior_bonus(self, monkeypatch):
+        # R3-2 bonus joins the *swapped* r_hard before normalization: equal
+        # r_hard candidates separate only through the behaviour bonus.
+        monkeypatch.setattr(generate_module, "REWARD_METRIC", "hard")
+        full = {"r_type": 1.0, "r_att": 1.0, "r_option": 1.0, "r_price": 1.0}
+        samples = self._group([(0.5, full), (0.5, full), (0.5, full), (0.5, full)])
+        for sample, bonus in zip(samples, (0.05, 0.0, -0.05, 0.0)):
+            sample.metadata["behavior_bonus"] = bonus
+        _, normalized = normalize_candidate_group_rewards(make_args(), samples)
+        assert normalized[0] > normalized[1] > normalized[2]  # ordered by bonus
+        assert sum(normalized) == pytest.approx(0.0, abs=1e-6)
+
+    def test_invalid_reward_metric_fails_at_import(self):
+        # module-level fail-fast: a typo'd SHOP_REWARD_METRIC must kill the
+        # worker at import time, not silently fall back to loose.
+        import os
+        import subprocess
+        import sys
+
+        slime_root = str(__import__("pathlib").Path(__file__).resolve().parents[2])
+        env = dict(os.environ, PYTHONPATH=slime_root, SHOP_REWARD_METRIC="strict")
+        result = subprocess.run(
+            [sys.executable, "-c", "import examples.ShopSimulator.generate"],
+            capture_output=True, text=True, env=env,
+        )
+        assert result.returncode != 0
+        assert "SHOP_REWARD_METRIC" in result.stderr
 
     def test_fully_filtered_group_is_skipped(self, monkeypatch):
         monkeypatch.setenv("SHOP_REQUIRE_NONZERO_VARIANCE_PER_ROLLOUT", "0")

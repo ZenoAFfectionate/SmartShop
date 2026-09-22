@@ -1,0 +1,93 @@
+{
+ "samples": [
+  {
+   "name": "detail_page",
+   "action": "click[824148419972]",
+   "text": "Instruction: [SEP] 帮我推荐一款美容镜，支持充电，带有LED灯光，适合在酒店式的浴室使用，支持打孔和免打孔安装，有双面折叠和伸缩功能，能挂在墙上，颜色要黑色，预算在300左右。 [SEP] Back to Search [SEP] < Prev [SEP] 颜色分类 [SEP] 黑色 明装插电款 按钮+触摸开关  三色光 [SEP] 黑色 暗装接线款 按钮+触摸开关  三色光 [SEP] 银色 明装插电款 按钮开关 白光 [SEP] 黑色 暗装接线款 按钮开关  白光 [SEP] 银色 暗装接线款 按钮+触摸开关  三色光 [SEP] 银色 暗装接线款  触摸调光  白光 [SEP] 银色 明装插电款  旋钮调光  白光 [SEP] 银色 暗装接线款  旋钮调光  白光 [SEP] 拉丝金 明装插电款 按钮开关 白光 [SEP] 银色 明装插电款 按钮+触摸开关  三色光 [SEP] 银色 暗装接线款 触摸开关  三色光 [SEP] 银色 明装插电款 触摸开关  三色光 [SEP] 黑色 明装插电款  按钮开关  白光 [SEP] 银色 充电款 旋钮调光 白光 [SEP] 银色 暗装接线款 按钮开关  白光 [SEP] 银色 充电款 按钮开关 白光 [SEP] 银色 明装插电款  触摸调光  白光 [SEP] 拉丝金 暗装接线款 按钮开关  白光 [SEP] 折叠led浴室镜酒店壁挂带灯镜子卫生间放大美容镜伸缩双面免打孔 [SEP] 价格: 288.0 to 338.0 [SEP] 店铺: 格瑞达家居旗舰店 [SEP] Description [SEP] Features [SEP] Reviews [SEP] Buy Now\n\n搜索功能是否可用: False\n\n可点击的按钮: [\"back to search\", \"< prev\", \"description\", \"features\", \"reviews\", \"buy now\", \"黑色 明装插电款 按钮+触摸开关  三色光\", \"黑色 暗装接线款 按钮+触摸开关  三色光\", \"银色 明装插电款 按钮开关 白光\", \"黑色 暗装接线款 按钮开关  白光\", \"银色 暗装接线款 按钮+触摸开关  三色光\", \"银色 暗装接线款  触摸调光  白光\", \"银色 明装插电款  旋钮调光  白光\", \"银色 暗装接线款  旋钮调光  白光\", \"拉丝金 明装插电款 按钮开关 白光\", \"银色 明装插电款 按钮+触摸开关  三色光\", \"银色 暗装接线款 触摸开关  三色光\", \"银色 明装插电款 触摸开关  三色光\", \"黑色 明装插电款  按钮开关  白光\", \"银色 充电款 旋钮调光 白光\", \"银色 暗装接线款 按钮开关  白光\", \"银色 充电款 按钮开关 白光\", \"银色 明装插电款  触摸调光  白光\", \"拉丝金 暗装接线款 按钮开关  白光\"]"
+  },
+  {
+   "name": "done_page",
+   "action": "click[buy now]",
+   "text": "已选规格: 黑色【充电款】镜面触屏开关 [SEP] Thank you for shopping with us! [SEP] Your code: [SEP] None [SEP] (Paste it in your MTurk interface.) [SEP] Purchased [SEP] asin [SEP] 617584252607 [SEP] options [SEP] {\"\\u989c\\u8272\\u5206\\u7c7b\": \"\\u9ed1\\u8272\\u3010\\u5145\\u7535\\u6b3e\\u3011\\u955c\\u9762\\u89e6\\u5c4f\\u5f00\\u5173\"} [SEP] attrs [SEP] None [SEP] category [SEP] None [SEP] query [SEP] None [SEP] product category [SEP] None [SEP] Target [SEP] asin [SEP] options [SEP] attrs [SEP] price upper [SEP] instuction text [SEP] category [SEP] product category [SEP] query [SEP] Goal [SEP] None [SEP] Reward [SEP] Your score (min 0.0, max 1.0) [SEP] 0.5555555555555556 [SEP] Reward Details [SEP] None\n\n搜索功能是否可用: False\n\n可点击的按钮: []"
+  },
+  {
+   "name": "search_page",
+   "action": "search[美容镜 充电 黑灯!]",
+   "text": "Instruction: [SEP] 帮我推荐一款美容镜，支持充电，带有LED灯光，适合在酒店式的浴室使用，支持打孔和免打孔安装，有双面折叠和伸缩功能，能挂在墙上，颜色要黑色，预算在300左右。 [SEP] Back to Search [SEP] Page 1 (Total results: 150) [SEP] Next > [SEP] 801801854113 [SEP] 枪灰LED充电免打孔浴室折叠美容镜三色灯触控双面化妆镜伸缩壁挂 [SEP] 316.0 to 356.0 [SEP] 625397120514 [SEP] LED浴室壁挂美容镜带灯单面折叠化妆镜伸缩充电3倍放大镜子免打孔 [SEP] 396.0 to 656.0 [SEP] 568498403099 [SEP] 充电美容仪眼部祛黑眼圈去纹眼袋热敷导入射频面部按摩仪器美眼仪 [SEP] 158.0 to 164.0 [SEP] 738295250701 [SEP] 牛奶光SDPL光子嫩肤充电家用淡斑美白祛黑祛印脱敏修复美容仪紧致 [SEP] 998.0 [SEP] 774272652940 [SEP] 化妆刷收纳袋绒布袋充电宝墨镜自拍杆美容仪防尘便携抽绳整理袋 [SEP] 5.0 to 7.0 [SEP] 596428603033 [SEP] OPT冰点无痛脱毛仪器更换灯管能量管手柄枪头E光充发次数维修皮秒 [SEP] 68.0 to 1400.0 [SEP] 668497244638 [SEP] opt冰点脱毛仪器维修更换灯管手柄发数360磁光配件640拨片漏水充 [SEP] 90.0 to 650.0 [SEP] 681602751786 [SEP] 手摇发电太阳能充电宝30000毫安足容自带线移动电源快充带强光灯 [SEP] 128.0 [SEP] 824148419972 [SEP] 折叠led浴室镜酒店壁挂带灯镜子卫生间放大美容镜伸缩双面免打孔 [SEP] 288.0 to 338.0 [SEP] 898371373439 [SEP] 复古免打孔浴室化妆镜带灯LED壁挂伸缩折叠卫生间美容镜全铜仿古 [SEP] 258.0 to 880.0 [SEP] 910341711868 [SEP] 别墅酒店1:3伸缩LED灯美容镜卫生间浴室补妆化妆镜免打孔放大镜 [SEP] 1036.0 to 1076.0 [SEP] 566418069846 [SEP] LED免打孔浴室美容镜带灯 双面折叠伸缩镜酒店式接线化妆镜壁挂 [SEP] 210.0 to 380.0 [SEP] 693924923238 [SEP] 吸盘枪灰色折叠化妆壁挂浴室镜卫生间化妆镜免打孔带灯伸缩美容镜 [SEP] 53.0 to 150.0 [SEP] 713045892007 [SEP] 全铜化妆镜子壁挂折叠伸缩LED灯浴室美容镜酒店卫生间单面放大镜 [SEP] 530.0 to 668.0 [SEP] 848069682219 [SEP] 全铜仿古浴室化妆镜带LED灯旋转折叠复古色美容镜酒店伸缩梳妆镜 [SEP] 258.0 to 880.0 [SEP] 867838979368 [SEP] 全铜美容镜免打孔折叠伸缩化妆镜卫生间酒店壁挂高清剃须镜带灯 [SEP] 356.0 to 786.0 [SEP] 885377729788 [SEP] 德国浴室化妆镜带LED灯可旋转折叠壁挂梳妆镜化妆台酒店美容镜 [SEP] 686.0 to 786.0 [SEP] 902265183751 [SEP] 科勒全铜美容镜浴室折叠旋转带灯化妆镜卫生间卧室双面梳妆镜子 [SEP] 698.0 to 1116.0 [SEP] 923702747164 [SEP] 浴室带灯化妆镜卫生间可伸缩折叠美容镜免打孔酒店放大镜子壁挂式 [SEP] 172.0 to 418.0 [SEP] 682049334951 [SEP] 浴室化妆镜led带灯美容镜壁挂折叠伸缩镜子酒店卫生间双面梳妆镜 [SEP] 476.0 to 616.0\n\n搜索功能是否可用: False\n\n可点击的按钮: [\"back to search\", \"next >\", \"801801854113\", \"625397120514\", \"568498403099\", \"738295250701\", \"774272652940\", \"596428603033\", \"668497244638\", \"681602751786\", \"824148419972\", \"898371373439\", \"910341711868\", \"566418069846\", \"693924923238\", \"713045892007\", \"848069682219\", \"867838979368\", \"885377729788\", \"902265183751\", \"923702747164\", \"682049334951\"]"
+  },
+  {
+   "name": "welcome_page",
+   "action": "click[back to search]",
+   "text": "WebShop [SEP] Instruction: [SEP] 帮我推荐一款美容镜，支持充电，带有LED灯光，适合在酒店式的浴室使用，支持打孔和免打孔安装，有双面折叠和伸缩功能，能挂在墙上，颜色要黑色，预算在300左右。 [SEP] Search\n\n搜索功能是否可用: True\n\n可点击的按钮: []"
+  },
+  {
+   "name": "empty",
+   "action": "",
+   "text": ""
+  },
+  {
+   "name": "no_separator",
+   "action": "click[123456789]",
+   "text": "纯文本错误页：未找到商品"
+  },
+  {
+   "name": "bad_action",
+   "action": "buy now",
+   "text": "Instruction: [SEP] 任务 [SEP] Back to Search [SEP] Page 1 (Total results: 2) [SEP] Next > [SEP] 123456789 [SEP] 测试商品标题 [SEP] 9.9"
+  },
+  {
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"颜色分类\": null}",
+   "name": "json_array_value"
+  },
+  {
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"颜色分类\": [\"红\",\"蓝\"]}",
+   "name": "json_int_like_keys"
+  },
+  {
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"2\": \"b\", \"1\": \"a\"}",
+   "name": "json_bool_and_float"
+  },
+  {
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"a\": true, \"b\": 2.0, \"c\": 0.5}",
+   "name": "json_nested_object"
+  },
+  {
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"a\": {\"x\": 1}}",
+   "name": "json_array_mixed"
+  },
+  {
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"颜色分类\": [\"红\", {\"k\": 1}, null]}"
+  },
+  {
+   "name": "json_nested_arrays",
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"a\": [[1,2],[3]]}"
+  },
+  {
+   "name": "json_empty_containers",
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"a\": [], \"b\": {}}"
+  },
+  {
+   "name": "json_numeric_array",
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"a\": [1, 2.5, null]}"
+  },
+  {
+   "name": "json_mixed_int_and_string_keys",
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] {\"10\": \"x\", \"2\": \"y\", \"k\": \"z\"}"
+  },
+  {
+   "name": "json_non_object_payload",
+   "action": "click[buy now]",
+   "text": "X [SEP] Thank you for shopping [SEP] asin [SEP] 123456789 [SEP] options [SEP] [1,2]"
+  }
+ ]
+}
